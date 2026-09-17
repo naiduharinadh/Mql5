@@ -1,0 +1,3131 @@
+//+------------------------------------------------------------------+
+//| XAUUSD Liquidity Sweep M15 EA                                    |
+//| EMA + RSI + ATR + Candlestick + Liquidity Sweep                 |
+//| Previous Swing High/Low SL & TP                                  |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "1.00"
+#property description "XAUUSD M15 Liquidity Sweep Strategy"
+#property description "Use on demo/backtest before live deployment."
+
+#include <Trade/Trade.mqh>
+
+CTrade trade;
+
+//====================================================================
+// GENERAL
+//====================================================================
+
+input string          TradeSymbol       = "XAUUSD";
+input ENUM_TIMEFRAMES TradeTimeframe    = PERIOD_M15;
+input ulong           MagicNumber       = 17092026;
+
+//====================================================================
+// RISK
+//====================================================================
+
+input double RiskPercent               = 1.0;
+input double MinimumRiskReward         = 2.0;
+
+input int    MaxOpenPositions          = 1;
+input int    MaxDailyTrades            = 2;
+input double MaxDailyLossPercent       = 2.0;
+
+//====================================================================
+// INDICATORS
+//====================================================================
+
+input int EMAFastPeriod                = 20;
+input int EMAMidPeriod                 = 50;
+input int EMASlowPeriod                = 200;
+
+input int RSIPeriod                    = 14;
+input double RSILevel                  = 50.0;
+
+input int ATRPeriod                    = 14;
+
+//====================================================================
+// PULLBACK
+//====================================================================
+
+input double PullbackATRMultiplier     = 0.25;
+
+//====================================================================
+// SWING
+//====================================================================
+
+input int SwingLookback                = 100;
+
+//====================================================================
+// STOP LOSS
+//====================================================================
+
+// BUY:
+//     SL = swept swing LOW - ATR buffer
+//
+// SELL:
+//     SL = swept swing HIGH + ATR buffer
+
+input double SL_ATR_Buffer             = 0.20;
+
+//====================================================================
+// TAKE PROFIT
+//====================================================================
+
+// TP is based on opposite confirmed swing.
+// Minimum RR must be satisfied.
+
+input bool RequireMinimumRR            = true;
+
+//====================================================================
+// LIQUIDITY SWEEP
+//====================================================================
+
+input bool RequireLiquiditySweep       = true;
+
+// BUY:
+//
+// confirmation candle LOW < previous confirmed swing LOW
+// AND
+// confirmation candle CLOSE > previous confirmed swing LOW
+//
+// SELL:
+//
+// confirmation candle HIGH > previous confirmed swing HIGH
+// AND
+// confirmation candle CLOSE < previous confirmed swing HIGH
+
+//====================================================================
+// CANDLE PATTERN
+//====================================================================
+
+input bool UseCandlestickFilter        = true;
+
+// BUY patterns
+input bool EnableBullishEngulfing      = true;
+input bool EnableHammer                = true;
+input bool EnableDragonflyDoji         = true;
+input bool EnableInvertedHammer        = true;
+input bool EnableBullishInsideBar      = true;
+
+// SELL patterns
+input bool EnableBearishEngulfing      = true;
+input bool EnableShootingStar           = true;
+input bool EnableGravestoneDoji         = true;
+input bool EnableHangingMan             = true;
+input bool EnableBearishInsideBar       = true;
+
+//====================================================================
+// CANDLE WICK SETTINGS
+//====================================================================
+
+input double HammerLowerWickRatio       = 2.5;
+input double HammerUpperWickMaxRatio    = 1.0;
+
+input double ShootingUpperWickRatio     = 2.5;
+input double ShootingLowerWickMaxRatio  = 1.0;
+
+input double DojiBodyPercent            = 0.10;
+
+//====================================================================
+// PREVIOUS CANDLE DIRECTION
+//====================================================================
+
+input bool BuyPatternRequiresPrevRed    = true;
+input bool SellPatternRequiresPrevGreen = true;
+
+//====================================================================
+// SESSION FILTER
+// Broker SERVER TIME
+//====================================================================
+
+input bool UseLondonSession             = true;
+input string LondonStart                = "08:00";
+input string LondonEnd                  = "12:00";
+
+input bool UseNewYorkSession            = true;
+input string NewYorkStart               = "13:00";
+input string NewYorkEnd                 = "17:00";
+
+//====================================================================
+// SPREAD
+//====================================================================
+
+input double MaxSpreadPoints            = 50.0;
+
+//====================================================================
+// LOGGING
+//====================================================================
+
+input bool EnableDetailedLogging        = true;
+input bool EnableCSVLogging             = true;
+
+string CSVFileName = "XAUUSD_LiquiditySweep_Trades.csv";
+
+//====================================================================
+// INDICATOR HANDLES
+//====================================================================
+
+int EMA20Handle  = INVALID_HANDLE;
+int EMA50Handle  = INVALID_HANDLE;
+int EMA200Handle = INVALID_HANDLE;
+int RSIHandle    = INVALID_HANDLE;
+int ATRHandle    = INVALID_HANDLE;
+int FractalHandle = INVALID_HANDLE;
+
+//====================================================================
+// GLOBAL
+//====================================================================
+
+datetime LastBarTime = 0;
+
+//====================================================================
+// INITIALIZATION
+//====================================================================
+
+int OnInit()
+{
+   Print("====================================================");
+   Print("XAUUSD LIQUIDITY SWEEP EA STARTING");
+   Print("====================================================");
+
+   if(!SymbolSelect(TradeSymbol, true))
+   {
+      Print("ERROR: Cannot select symbol: ", TradeSymbol);
+      return INIT_FAILED;
+   }
+
+   EMA20Handle =
+      iMA(
+         TradeSymbol,
+         TradeTimeframe,
+         EMAFastPeriod,
+         0,
+         MODE_EMA,
+         PRICE_CLOSE
+      );
+
+   EMA50Handle =
+      iMA(
+         TradeSymbol,
+         TradeTimeframe,
+         EMAMidPeriod,
+         0,
+         MODE_EMA,
+         PRICE_CLOSE
+      );
+
+   EMA200Handle =
+      iMA(
+         TradeSymbol,
+         TradeTimeframe,
+         EMASlowPeriod,
+         0,
+         MODE_EMA,
+         PRICE_CLOSE
+      );
+
+   RSIHandle =
+      iRSI(
+         TradeSymbol,
+         TradeTimeframe,
+         RSIPeriod,
+         PRICE_CLOSE
+      );
+
+   ATRHandle =
+      iATR(
+         TradeSymbol,
+         TradeTimeframe,
+         ATRPeriod
+      );
+
+   FractalHandle =
+      iFractals(
+         TradeSymbol,
+         TradeTimeframe
+      );
+
+   if(
+      EMA20Handle == INVALID_HANDLE ||
+      EMA50Handle == INVALID_HANDLE ||
+      EMA200Handle == INVALID_HANDLE ||
+      RSIHandle == INVALID_HANDLE ||
+      ATRHandle == INVALID_HANDLE ||
+      FractalHandle == INVALID_HANDLE
+   )
+   {
+      Print("ERROR: Indicator initialization failed.");
+      return INIT_FAILED;
+   }
+
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetTypeFillingBySymbol(TradeSymbol);
+
+   Print("Symbol          : ", TradeSymbol);
+   Print("Timeframe       : M15");
+   Print("Risk            : ", RiskPercent, "%");
+   Print("Minimum RR      : ", MinimumRiskReward);
+   Print("Liquidity Sweep : ", RequireLiquiditySweep);
+   Print("CSV Logging     : ", EnableCSVLogging);
+   Print("EA READY");
+
+   return INIT_SUCCEEDED;
+}
+
+//====================================================================
+// DEINITIALIZATION
+//====================================================================
+
+void OnDeinit(const int reason)
+{
+   if(EMA20Handle != INVALID_HANDLE)
+      IndicatorRelease(EMA20Handle);
+
+   if(EMA50Handle != INVALID_HANDLE)
+      IndicatorRelease(EMA50Handle);
+
+   if(EMA200Handle != INVALID_HANDLE)
+      IndicatorRelease(EMA200Handle);
+
+   if(RSIHandle != INVALID_HANDLE)
+      IndicatorRelease(RSIHandle);
+
+   if(ATRHandle != INVALID_HANDLE)
+      IndicatorRelease(ATRHandle);
+
+   if(FractalHandle != INVALID_HANDLE)
+      IndicatorRelease(FractalHandle);
+
+   Print("EA stopped.");
+}
+
+//====================================================================
+// ON TICK
+//====================================================================
+
+void OnTick()
+{
+   if(!IsNewBar())
+      return;
+
+   ProcessSignal();
+}
+
+//====================================================================
+// NEW BAR
+//====================================================================
+
+bool IsNewBar()
+{
+   datetime barTime =
+      iTime(
+         TradeSymbol,
+         TradeTimeframe,
+         0
+      );
+
+   if(barTime <= 0)
+      return false;
+
+   if(barTime == LastBarTime)
+      return false;
+
+   LastBarTime = barTime;
+
+   Print("----------------------------------------------------");
+   Print(
+      "NEW M15 BAR: ",
+      TimeToString(barTime, TIME_DATE | TIME_MINUTES)
+   );
+
+   return true;
+}
+
+//====================================================================
+// MAIN PROCESS
+//====================================================================
+
+void ProcessSignal()
+{
+   Print("Checking strategy...");
+
+   //---------------------------------------------------------------
+   // SESSION
+   //---------------------------------------------------------------
+
+   if(!IsTradingSession())
+   {
+      Print("REJECT: Outside trading session.");
+      return;
+   }
+
+   //---------------------------------------------------------------
+   // SPREAD
+   //---------------------------------------------------------------
+
+   double spread = GetSpreadPoints();
+
+   if(spread > MaxSpreadPoints)
+   {
+      Print(
+         "REJECT: Spread too high = ",
+         DoubleToString(spread, 1),
+         " points. Maximum = ",
+         MaxSpreadPoints
+      );
+
+      return;
+   }
+
+   //---------------------------------------------------------------
+   // DAILY LOSS
+   //---------------------------------------------------------------
+
+   if(!CheckDailyLoss())
+   {
+      Print("REJECT: Daily loss limit reached.");
+      return;
+   }
+
+   //---------------------------------------------------------------
+   // DAILY TRADES
+   //---------------------------------------------------------------
+
+   if(!CheckDailyTradeLimit())
+   {
+      Print("REJECT: Maximum daily trades reached.");
+      return;
+   }
+
+   //---------------------------------------------------------------
+   // OPEN POSITION
+   //---------------------------------------------------------------
+
+   if(CountOurPositions() >= MaxOpenPositions)
+   {
+      Print("REJECT: Existing position already open.");
+      return;
+   }
+
+   //---------------------------------------------------------------
+   // INDICATORS
+   //---------------------------------------------------------------
+
+   double ema20[];
+   double ema50[];
+   double ema200[];
+   double rsi[];
+   double atr[];
+
+   ArrayResize(ema20, 3);
+   ArrayResize(ema50, 3);
+   ArrayResize(ema200, 3);
+   ArrayResize(rsi, 3);
+   ArrayResize(atr, 3);
+
+   ArraySetAsSeries(ema20, true);
+   ArraySetAsSeries(ema50, true);
+   ArraySetAsSeries(ema200, true);
+   ArraySetAsSeries(rsi, true);
+   ArraySetAsSeries(atr, true);
+
+   if(CopyBuffer(EMA20Handle, 0, 0, 3, ema20) != 3)
+   {
+      Print("REJECT: EMA20 unavailable.");
+      return;
+   }
+
+   if(CopyBuffer(EMA50Handle, 0, 0, 3, ema50) != 3)
+   {
+      Print("REJECT: EMA50 unavailable.");
+      return;
+   }
+
+   if(CopyBuffer(EMA200Handle, 0, 0, 3, ema200) != 3)
+   {
+      Print("REJECT: EMA200 unavailable.");
+      return;
+   }
+
+   if(CopyBuffer(RSIHandle, 0, 0, 3, rsi) != 3)
+   {
+      Print("REJECT: RSI unavailable.");
+      return;
+   }
+
+   if(CopyBuffer(ATRHandle, 0, 0, 3, atr) != 3)
+   {
+      Print("REJECT: ATR unavailable.");
+      return;
+   }
+
+   //---------------------------------------------------------------
+   // CLOSED CANDLES
+   //
+   // [0] = new/current candle
+   // [1] = completed confirmation candle
+   // [2] = candle before confirmation
+   //---------------------------------------------------------------
+
+   double open1 =
+      iOpen(TradeSymbol, TradeTimeframe, 1);
+
+   double high1 =
+      iHigh(TradeSymbol, TradeTimeframe, 1);
+
+   double low1 =
+      iLow(TradeSymbol, TradeTimeframe, 1);
+
+   double close1 =
+      iClose(TradeSymbol, TradeTimeframe, 1);
+
+   double open2 =
+      iOpen(TradeSymbol, TradeTimeframe, 2);
+
+   double high2 =
+      iHigh(TradeSymbol, TradeTimeframe, 2);
+
+   double low2 =
+      iLow(TradeSymbol, TradeTimeframe, 2);
+
+   double close2 =
+      iClose(TradeSymbol, TradeTimeframe, 2);
+
+   //---------------------------------------------------------------
+   // LOG MARKET STATE
+   //---------------------------------------------------------------
+
+   LogMarketState(
+      ema20[1],
+      ema50[1],
+      ema200[1],
+      rsi[1],
+      atr[1],
+      open1,
+      high1,
+      low1,
+      close1,
+      spread
+   );
+
+   //---------------------------------------------------------------
+   // BUY
+   //---------------------------------------------------------------
+
+   bool buyTrend =
+      ema50[1] > ema200[1];
+
+   bool buyAbove200 =
+      close1 > ema200[1];
+
+   bool buyPullback =
+      IsPullback(
+         close1,
+         ema20[1],
+         ema50[1],
+         atr[1]
+      );
+
+   bool buyRSI =
+      rsi[2] < RSILevel &&
+      rsi[1] > RSILevel;
+
+   //---------------------------------------------------------------
+   // BULLISH CANDLE
+   //---------------------------------------------------------------
+
+   string buyPattern = "";
+
+   bool buyCandle =
+      CheckBullishPattern(
+         1,
+         buyPattern
+      );
+
+   //---------------------------------------------------------------
+   // LIQUIDITY
+   //---------------------------------------------------------------
+
+   double referenceLow = 0.0;
+
+   bool buySweep =
+      FindBuyLiquiditySweep(
+         referenceLow
+      );
+
+   //---------------------------------------------------------------
+   // LOG BUY CONDITIONS
+   //---------------------------------------------------------------
+
+   Print("BUY CONDITIONS");
+   Print("Trend EMA50 > EMA200 : ", BoolText(buyTrend));
+   Print("Close > EMA200       : ", BoolText(buyAbove200));
+   Print("Pullback             : ", BoolText(buyPullback));
+   Print(
+      "RSI ",
+      DoubleToString(rsi[2], 2),
+      " -> ",
+      DoubleToString(rsi[1], 2),
+      " : ",
+      BoolText(buyRSI)
+   );
+
+   Print(
+      "Candle Pattern       : ",
+      buyCandle ? buyPattern : "NONE"
+   );
+
+   if(RequireLiquiditySweep)
+   {
+      Print(
+         "Liquidity Sweep      : ",
+         BoolText(buySweep)
+      );
+
+      if(buySweep)
+      {
+         Print(
+            "Swept Previous LOW   : ",
+            DoubleToString(referenceLow, DigitsSymbol())
+         );
+      }
+   }
+
+   //---------------------------------------------------------------
+   // BUY SIGNAL
+   //---------------------------------------------------------------
+
+   if(
+      buyTrend &&
+      buyAbove200 &&
+      buyPullback &&
+      buyRSI &&
+      buyCandle &&
+      (!RequireLiquiditySweep || buySweep)
+   )
+   {
+      Print("####################################################");
+      Print("BUY SIGNAL CONFIRMED");
+      Print("Pattern = ", buyPattern);
+      Print("####################################################");
+
+      ExecuteBuy(
+         atr[1],
+         referenceLow,
+         buyPattern
+      );
+
+      return;
+   }
+
+   //---------------------------------------------------------------
+   // SELL
+   //---------------------------------------------------------------
+
+   bool sellTrend =
+      ema50[1] < ema200[1];
+
+   bool sellBelow200 =
+      close1 < ema200[1];
+
+   bool sellPullback =
+      IsPullback(
+         close1,
+         ema20[1],
+         ema50[1],
+         atr[1]
+      );
+
+   bool sellRSI =
+      rsi[2] > RSILevel &&
+      rsi[1] < RSILevel;
+
+   string sellPattern = "";
+
+   bool sellCandle =
+      CheckBearishPattern(
+         1,
+         sellPattern
+      );
+
+   double referenceHigh = 0.0;
+
+   bool sellSweep =
+      FindSellLiquiditySweep(
+         referenceHigh
+      );
+
+   //---------------------------------------------------------------
+   // LOG SELL CONDITIONS
+   //---------------------------------------------------------------
+
+   Print("SELL CONDITIONS");
+   Print("Trend EMA50 < EMA200 : ", BoolText(sellTrend));
+   Print("Close < EMA200       : ", BoolText(sellBelow200));
+   Print("Pullback             : ", BoolText(sellPullback));
+
+   Print(
+      "RSI ",
+      DoubleToString(rsi[2], 2),
+      " -> ",
+      DoubleToString(rsi[1], 2),
+      " : ",
+      BoolText(sellRSI)
+   );
+
+   Print(
+      "Candle Pattern       : ",
+      sellCandle ? sellPattern : "NONE"
+   );
+
+   if(RequireLiquiditySweep)
+   {
+      Print(
+         "Liquidity Sweep      : ",
+         BoolText(sellSweep)
+      );
+
+      if(sellSweep)
+      {
+         Print(
+            "Swept Previous HIGH  : ",
+            DoubleToString(referenceHigh, DigitsSymbol())
+         );
+      }
+   }
+
+   //---------------------------------------------------------------
+   // SELL SIGNAL
+   //---------------------------------------------------------------
+
+   if(
+      sellTrend &&
+      sellBelow200 &&
+      sellPullback &&
+      sellRSI &&
+      sellCandle &&
+      (!RequireLiquiditySweep || sellSweep)
+   )
+   {
+      Print("####################################################");
+      Print("SELL SIGNAL CONFIRMED");
+      Print("Pattern = ", sellPattern);
+      Print("####################################################");
+
+      ExecuteSell(
+         atr[1],
+         referenceHigh,
+         sellPattern
+      );
+
+      return;
+   }
+
+   Print("No complete trading signal.");
+}
+
+//====================================================================
+// PULLBACK
+//====================================================================
+
+bool IsPullback(
+   double closePrice,
+   double ema20,
+   double ema50,
+   double atr
+)
+{
+   double distance20 =
+      MathAbs(closePrice - ema20);
+
+   double distance50 =
+      MathAbs(closePrice - ema50);
+
+   double maximumDistance =
+      PullbackATRMultiplier * atr;
+
+   return
+      distance20 <= maximumDistance ||
+      distance50 <= maximumDistance;
+}
+
+//====================================================================
+// BUY LIQUIDITY SWEEP
+//====================================================================
+
+bool FindBuyLiquiditySweep(
+   double &referenceLow
+)
+{
+   double fractalLows[];
+
+   ArrayResize(
+      fractalLows,
+      SwingLookback + 10
+   );
+
+   ArraySetAsSeries(
+      fractalLows,
+      true
+   );
+
+   int copied =
+      CopyBuffer(
+         FractalHandle,
+         1,
+         0,
+         SwingLookback + 10,
+         fractalLows
+      );
+
+   if(copied <= 0)
+   {
+      Print("Unable to read fractal lows.");
+      return false;
+   }
+
+   double confirmationLow =
+      iLow(
+         TradeSymbol,
+         TradeTimeframe,
+         1
+      );
+
+   double confirmationClose =
+      iClose(
+         TradeSymbol,
+         TradeTimeframe,
+         1
+      );
+
+   //---------------------------------------------------------------
+   // Start at shift 2.
+   //
+   // A fractal at shift 2 is already confirmed because candle 1
+   // and the newly opened candle 0 exist after it.
+   //---------------------------------------------------------------
+
+   for(int shift = 2; shift < copied; shift++)
+   {
+      if(fractalLows[shift] == EMPTY_VALUE)
+         continue;
+
+      if(fractalLows[shift] <= 0)
+         continue;
+
+      double previousLow =
+         fractalLows[shift];
+
+      //------------------------------------------------------------
+      // LIQUIDITY SWEEP
+      //
+      // Price must go BELOW previous low.
+      //------------------------------------------------------------
+
+      bool swept =
+         confirmationLow < previousLow;
+
+      //------------------------------------------------------------
+      // RECLAIM
+      //
+      // Candle must close ABOVE previous low.
+      //------------------------------------------------------------
+
+      bool reclaimed =
+         confirmationClose > previousLow;
+
+      if(swept && reclaimed)
+      {
+         referenceLow = previousLow;
+
+         Print(
+            "BUY LIQUIDITY SWEEP CONFIRMED | ",
+            "Reference Low=",
+            DoubleToString(
+               referenceLow,
+               DigitsSymbol()
+            ),
+            " Sweep Low=",
+            DoubleToString(
+               confirmationLow,
+               DigitsSymbol()
+            ),
+            " Close=",
+            DoubleToString(
+               confirmationClose,
+               DigitsSymbol()
+            )
+         );
+
+         return true;
+      }
+   }
+
+   return false;
+}
+
+//====================================================================
+// SELL LIQUIDITY SWEEP
+//====================================================================
+
+bool FindSellLiquiditySweep(
+   double &referenceHigh
+)
+{
+   double fractalHighs[];
+
+   ArrayResize(
+      fractalHighs,
+      SwingLookback + 10
+   );
+
+   ArraySetAsSeries(
+      fractalHighs,
+      true
+   );
+
+   int copied =
+      CopyBuffer(
+         FractalHandle,
+         0,
+         0,
+         SwingLookback + 10,
+         fractalHighs
+      );
+
+   if(copied <= 0)
+   {
+      Print("Unable to read fractal highs.");
+      return false;
+   }
+
+   double confirmationHigh =
+      iHigh(
+         TradeSymbol,
+         TradeTimeframe,
+         1
+      );
+
+   double confirmationClose =
+      iClose(
+         TradeSymbol,
+         TradeTimeframe,
+         1
+      );
+
+   for(int shift = 2; shift < copied; shift++)
+   {
+      if(fractalHighs[shift] == EMPTY_VALUE)
+         continue;
+
+      if(fractalHighs[shift] <= 0)
+         continue;
+
+      double previousHigh =
+         fractalHighs[shift];
+
+      //------------------------------------------------------------
+      // LIQUIDITY SWEEP
+      //------------------------------------------------------------
+
+      bool swept =
+         confirmationHigh > previousHigh;
+
+      //------------------------------------------------------------
+      // RECLAIM
+      //------------------------------------------------------------
+
+      bool reclaimed =
+         confirmationClose < previousHigh;
+
+      if(swept && reclaimed)
+      {
+         referenceHigh = previousHigh;
+
+         Print(
+            "SELL LIQUIDITY SWEEP CONFIRMED | ",
+            "Reference High=",
+            DoubleToString(
+               referenceHigh,
+               DigitsSymbol()
+            ),
+            " Sweep High=",
+            DoubleToString(
+               confirmationHigh,
+               DigitsSymbol()
+            ),
+            " Close=",
+            DoubleToString(
+               confirmationClose,
+               DigitsSymbol()
+            )
+         );
+
+         return true;
+      }
+   }
+
+   return false;
+}
+
+//====================================================================
+// BUY CANDLE PATTERNS
+//====================================================================
+
+bool CheckBullishPattern(
+   int shift,
+   string &pattern
+)
+{
+   pattern = "";
+
+   if(!UseCandlestickFilter)
+   {
+      if(
+         iClose(
+            TradeSymbol,
+            TradeTimeframe,
+            shift
+         ) >
+         iOpen(
+            TradeSymbol,
+            TradeTimeframe,
+            shift
+         )
+      )
+      {
+         pattern = "BULLISH_CLOSE";
+         return true;
+      }
+
+      return false;
+   }
+
+   //---------------------------------------------------------------
+   // Previous candle RED
+   //---------------------------------------------------------------
+
+   bool previousRed =
+      iClose(
+         TradeSymbol,
+         TradeTimeframe,
+         shift + 1
+      )
+      <
+      iOpen(
+         TradeSymbol,
+         TradeTimeframe,
+         shift + 1
+      );
+
+   if(
+      BuyPatternRequiresPrevRed &&
+      !previousRed
+   )
+   {
+      return false;
+   }
+
+   //---------------------------------------------------------------
+   // Patterns
+   //---------------------------------------------------------------
+
+   if(
+      EnableBullishEngulfing &&
+      IsBullishEngulfing(shift)
+   )
+   {
+      pattern = "BULLISH_ENGULFING";
+      return true;
+   }
+
+   if(
+      EnableHammer &&
+      IsHammer(shift)
+   )
+   {
+      pattern = "HAMMER";
+      return true;
+   }
+
+   if(
+      EnableDragonflyDoji &&
+      IsDragonflyDoji(shift)
+   )
+   {
+      pattern = "DRAGONFLY_DOJI";
+      return true;
+   }
+
+   if(
+      EnableInvertedHammer &&
+      IsInvertedHammer(shift)
+   )
+   {
+      pattern = "INVERTED_HAMMER";
+      return true;
+   }
+
+   if(
+      EnableBullishInsideBar &&
+      IsBullishInsideBar(shift)
+   )
+   {
+      pattern = "BULLISH_INSIDE_BAR";
+      return true;
+   }
+
+   return false;
+}
+
+//====================================================================
+// SELL CANDLE PATTERNS
+//====================================================================
+
+bool CheckBearishPattern(
+   int shift,
+   string &pattern
+)
+{
+   pattern = "";
+
+   if(!UseCandlestickFilter)
+   {
+      if(
+         iClose(
+            TradeSymbol,
+            TradeTimeframe,
+            shift
+         )
+         <
+         iOpen(
+            TradeSymbol,
+            TradeTimeframe,
+            shift
+         )
+      )
+      {
+         pattern = "BEARISH_CLOSE";
+         return true;
+      }
+
+      return false;
+   }
+
+   //---------------------------------------------------------------
+   // Previous candle GREEN
+   //---------------------------------------------------------------
+
+   bool previousGreen =
+      iClose(
+         TradeSymbol,
+         TradeTimeframe,
+         shift + 1
+      )
+      >
+      iOpen(
+         TradeSymbol,
+         TradeTimeframe,
+         shift + 1
+      );
+
+   if(
+      SellPatternRequiresPrevGreen &&
+      !previousGreen
+   )
+   {
+      return false;
+   }
+
+   //---------------------------------------------------------------
+   // Patterns
+   //---------------------------------------------------------------
+
+   if(
+      EnableBearishEngulfing &&
+      IsBearishEngulfing(shift)
+   )
+   {
+      pattern = "BEARISH_ENGULFING";
+      return true;
+   }
+
+   if(
+      EnableShootingStar &&
+      IsShootingStar(shift)
+   )
+   {
+      pattern = "SHOOTING_STAR";
+      return true;
+   }
+
+   if(
+      EnableGravestoneDoji &&
+      IsGravestoneDoji(shift)
+   )
+   {
+      pattern = "GRAVESTONE_DOJI";
+      return true;
+   }
+
+   if(
+      EnableHangingMan &&
+      IsHangingMan(shift)
+   )
+   {
+      pattern = "HANGING_MAN";
+      return true;
+   }
+
+   if(
+      EnableBearishInsideBar &&
+      IsBearishInsideBar(shift)
+   )
+   {
+      pattern = "BEARISH_INSIDE_BAR";
+      return true;
+   }
+
+   return false;
+}
+
+//====================================================================
+// CANDLE CALCULATIONS
+//====================================================================
+
+double CandleBody(int shift)
+{
+   double open =
+      iOpen(
+         TradeSymbol,
+         TradeTimeframe,
+         shift
+      );
+
+   double close =
+      iClose(
+         TradeSymbol,
+         TradeTimeframe,
+         shift
+      );
+
+   return MathAbs(close - open);
+}
+
+//--------------------------------------------------------------------
+
+double UpperWick(int shift)
+{
+   double open =
+      iOpen(
+         TradeSymbol,
+         TradeTimeframe,
+         shift
+      );
+
+   double close =
+      iClose(
+         TradeSymbol,
+         TradeTimeframe,
+         shift
+      );
+
+   double high =
+      iHigh(
+         TradeSymbol,
+         TradeTimeframe,
+         shift
+      );
+
+   return high - MathMax(open, close);
+}
+
+//--------------------------------------------------------------------
+
+double LowerWick(int shift)
+{
+   double open =
+      iOpen(
+         TradeSymbol,
+         TradeTimeframe,
+         shift
+      );
+
+   double close =
+      iClose(
+         TradeSymbol,
+         TradeTimeframe,
+         shift
+      );
+
+   double low =
+      iLow(
+         TradeSymbol,
+         TradeTimeframe,
+         shift
+      );
+
+   return MathMin(open, close) - low;
+}
+
+//--------------------------------------------------------------------
+
+double CandleRange(int shift)
+{
+   return
+      iHigh(
+         TradeSymbol,
+         TradeTimeframe,
+         shift
+      )
+      -
+      iLow(
+         TradeSymbol,
+         TradeTimeframe,
+         shift
+      );
+}
+
+//====================================================================
+// BULLISH ENGULFING
+//====================================================================
+
+bool IsBullishEngulfing(int shift)
+{
+   double open1 =
+      iOpen(TradeSymbol, TradeTimeframe, shift);
+
+   double close1 =
+      iClose(TradeSymbol, TradeTimeframe, shift);
+
+   double open2 =
+      iOpen(TradeSymbol, TradeTimeframe, shift + 1);
+
+   double close2 =
+      iClose(TradeSymbol, TradeTimeframe, shift + 1);
+
+   if(close1 <= open1)
+      return false;
+
+   if(close2 >= open2)
+      return false;
+
+   //---------------------------------------------------------------
+   // Current BODY engulfs previous BODY
+   //---------------------------------------------------------------
+
+   if(open1 > close2)
+      return false;
+
+   if(close1 < open2)
+      return false;
+
+   return true;
+}
+
+//====================================================================
+// BEARISH ENGULFING
+//====================================================================
+
+bool IsBearishEngulfing(int shift)
+{
+   double open1 =
+      iOpen(TradeSymbol, TradeTimeframe, shift);
+
+   double close1 =
+      iClose(TradeSymbol, TradeTimeframe, shift);
+
+   double open2 =
+      iOpen(TradeSymbol, TradeTimeframe, shift + 1);
+
+   double close2 =
+      iClose(TradeSymbol, TradeTimeframe, shift + 1);
+
+   if(close1 >= open1)
+      return false;
+
+   if(close2 <= open2)
+      return false;
+
+   if(open1 < close2)
+      return false;
+
+   if(close1 > open2)
+      return false;
+
+   return true;
+}
+
+//====================================================================
+// HAMMER
+//====================================================================
+
+bool IsHammer(int shift)
+{
+   double body =
+      CandleBody(shift);
+
+   double lower =
+      LowerWick(shift);
+
+   double upper =
+      UpperWick(shift);
+
+   if(body <= 0)
+      return false;
+
+   if(
+      lower <
+      HammerLowerWickRatio * body
+   )
+      return false;
+
+   if(
+      upper >
+      HammerUpperWickMaxRatio * body
+   )
+      return false;
+
+   return true;
+}
+
+//====================================================================
+// SHOOTING STAR
+//====================================================================
+
+bool IsShootingStar(int shift)
+{
+   double body =
+      CandleBody(shift);
+
+   double upper =
+      UpperWick(shift);
+
+   double lower =
+      LowerWick(shift);
+
+   if(body <= 0)
+      return false;
+
+   if(
+      upper <
+      ShootingUpperWickRatio * body
+   )
+      return false;
+
+   if(
+      lower >
+      ShootingLowerWickMaxRatio * body
+   )
+      return false;
+
+   return true;
+}
+
+//====================================================================
+// DRAGONFLY DOJI
+//====================================================================
+
+bool IsDragonflyDoji(int shift)
+{
+   double body =
+      CandleBody(shift);
+
+   double range =
+      CandleRange(shift);
+
+   double upper =
+      UpperWick(shift);
+
+   double lower =
+      LowerWick(shift);
+
+   if(range <= 0)
+      return false;
+
+   if(
+      body >
+      range * DojiBodyPercent
+   )
+      return false;
+
+   if(
+      lower <
+      upper * 2.0
+   )
+      return false;
+
+   return true;
+}
+
+//====================================================================
+// GRAVESTONE DOJI
+//====================================================================
+
+bool IsGravestoneDoji(int shift)
+{
+   double body =
+      CandleBody(shift);
+
+   double range =
+      CandleRange(shift);
+
+   double upper =
+      UpperWick(shift);
+
+   double lower =
+      LowerWick(shift);
+
+   if(range <= 0)
+      return false;
+
+   if(
+      body >
+      range * DojiBodyPercent
+   )
+      return false;
+
+   if(
+      upper <
+      lower * 2.0
+   )
+      return false;
+
+   return true;
+}
+
+//====================================================================
+// INVERTED HAMMER
+//====================================================================
+
+bool IsInvertedHammer(int shift)
+{
+   double body =
+      CandleBody(shift);
+
+   double upper =
+      UpperWick(shift);
+
+   double lower =
+      LowerWick(shift);
+
+   if(body <= 0)
+      return false;
+
+   if(
+      upper <
+      HammerLowerWickRatio * body
+   )
+      return false;
+
+   if(
+      lower >
+      HammerUpperWickMaxRatio * body
+   )
+      return false;
+
+   return true;
+}
+
+//====================================================================
+// HANGING MAN
+//====================================================================
+
+bool IsHangingMan(int shift)
+{
+   double body =
+      CandleBody(shift);
+
+   double lower =
+      LowerWick(shift);
+
+   double upper =
+      UpperWick(shift);
+
+   if(body <= 0)
+      return false;
+
+   if(
+      lower <
+      HammerLowerWickRatio * body
+   )
+      return false;
+
+   if(
+      upper >
+      HammerUpperWickMaxRatio * body
+   )
+      return false;
+
+   return true;
+}
+
+//====================================================================
+// BULLISH INSIDE BAR
+//====================================================================
+
+bool IsBullishInsideBar(int shift)
+{
+   double high1 =
+      iHigh(
+         TradeSymbol,
+         TradeTimeframe,
+         shift
+      );
+
+   double low1 =
+      iLow(
+         TradeSymbol,
+         TradeTimeframe,
+         shift
+      );
+
+   double high2 =
+      iHigh(
+         TradeSymbol,
+         TradeTimeframe,
+         shift + 1
+      );
+
+   double low2 =
+      iLow(
+         TradeSymbol,
+         TradeTimeframe,
+         shift + 1
+      );
+
+   double open1 =
+      iOpen(
+         TradeSymbol,
+         TradeTimeframe,
+         shift
+      );
+
+   double close1 =
+      iClose(
+         TradeSymbol,
+         TradeTimeframe,
+         shift
+      );
+
+   if(high1 >= high2)
+      return false;
+
+   if(low1 <= low2)
+      return false;
+
+   if(close1 <= open1)
+      return false;
+
+   return true;
+}
+
+//====================================================================
+// BEARISH INSIDE BAR
+//====================================================================
+
+bool IsBearishInsideBar(int shift)
+{
+   double high1 =
+      iHigh(
+         TradeSymbol,
+         TradeTimeframe,
+         shift
+      );
+
+   double low1 =
+      iLow(
+         TradeSymbol,
+         TradeTimeframe,
+         shift
+      );
+
+   double high2 =
+      iHigh(
+         TradeSymbol,
+         TradeTimeframe,
+         shift + 1
+      );
+
+   double low2 =
+      iLow(
+         TradeSymbol,
+         TradeTimeframe,
+         shift + 1
+      );
+
+   double open1 =
+      iOpen(
+         TradeSymbol,
+         TradeTimeframe,
+         shift
+      );
+
+   double close1 =
+      iClose(
+         TradeSymbol,
+         TradeTimeframe,
+         shift
+      );
+
+   if(high1 >= high2)
+      return false;
+
+   if(low1 <= low2)
+      return false;
+
+   if(close1 >= open1)
+      return false;
+
+   return true;
+}
+
+//====================================================================
+// EXECUTE BUY
+//====================================================================
+
+void ExecuteBuy(
+   double atr,
+   double sweptLow,
+   string pattern
+)
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(
+      TradeSymbol,
+      tick
+   ))
+   {
+      Print("BUY REJECTED: Cannot get tick.");
+      return;
+   }
+
+   double entry =
+      tick.ask;
+
+   //---------------------------------------------------------------
+   // SL based on swept previous LOW
+   //---------------------------------------------------------------
+
+   double sl =
+      sweptLow -
+      (SL_ATR_Buffer * atr);
+
+   sl =
+      NormalizePrice(sl);
+
+   if(sl >= entry)
+   {
+      Print("BUY REJECTED: SL >= Entry.");
+      return;
+   }
+
+   //---------------------------------------------------------------
+   // Find previous confirmed HIGH for TP
+   //---------------------------------------------------------------
+
+   double targetHigh = 0.0;
+
+   if(!FindPreviousSwingHigh(targetHigh))
+   {
+      Print(
+         "BUY REJECTED: No confirmed previous swing HIGH."
+      );
+
+      return;
+   }
+
+   targetHigh =
+      NormalizePrice(targetHigh);
+
+   //---------------------------------------------------------------
+   // Risk
+   //---------------------------------------------------------------
+
+   double riskDistance =
+      entry - sl;
+
+   if(riskDistance <= 0)
+   {
+      Print("BUY REJECTED: Invalid risk distance.");
+      return;
+   }
+
+   //---------------------------------------------------------------
+   // TP based on previous confirmed HIGH
+   //---------------------------------------------------------------
+
+   double tp =
+      targetHigh;
+
+   double rewardDistance =
+      tp - entry;
+
+   if(rewardDistance <= 0)
+   {
+      Print(
+         "BUY REJECTED: Previous HIGH is below entry."
+      );
+
+      return;
+   }
+
+   double actualRR =
+      rewardDistance /
+      riskDistance;
+
+   //---------------------------------------------------------------
+   // Minimum RR
+   //---------------------------------------------------------------
+
+   if(
+      RequireMinimumRR &&
+      actualRR < MinimumRiskReward
+   )
+   {
+      Print(
+         "BUY REJECTED: Previous HIGH gives RR=",
+         DoubleToString(actualRR, 2),
+         " < required ",
+         DoubleToString(
+            MinimumRiskReward,
+            2
+         )
+      );
+
+      return;
+   }
+
+   //---------------------------------------------------------------
+   // Broker stop validation
+   //---------------------------------------------------------------
+
+   if(!ValidateStops(
+      ORDER_TYPE_BUY,
+      entry,
+      sl,
+      tp
+   ))
+   {
+      Print("BUY REJECTED: Broker stop-distance rule.");
+      return;
+   }
+
+   //---------------------------------------------------------------
+   // Calculate lot
+   //---------------------------------------------------------------
+
+   double lot =
+      CalculateLotSize(
+         ORDER_TYPE_BUY,
+         entry,
+         sl
+      );
+
+   if(lot <= 0)
+   {
+      Print("BUY REJECTED: Invalid calculated lot.");
+      return;
+   }
+
+   //---------------------------------------------------------------
+   // Detailed signal
+   //---------------------------------------------------------------
+
+   Print("====================================================");
+   Print("BUY TRADE DETAILS");
+   Print("====================================================");
+
+   Print("Pattern              : ", pattern);
+   Print("Entry                : ",
+         DoubleToString(entry, DigitsSymbol()));
+
+   Print("Swept Previous LOW   : ",
+         DoubleToString(sweptLow, DigitsSymbol()));
+
+   Print("SL                   : ",
+         DoubleToString(sl, DigitsSymbol()));
+
+   Print("Previous Swing HIGH  : ",
+         DoubleToString(targetHigh, DigitsSymbol()));
+
+   Print("TP                   : ",
+         DoubleToString(tp, DigitsSymbol()));
+
+   Print("Risk Distance        : ",
+         DoubleToString(riskDistance, DigitsSymbol()));
+
+   Print("Reward Distance      : ",
+         DoubleToString(rewardDistance, DigitsSymbol()));
+
+   Print("RR                   : ",
+         DoubleToString(actualRR, 2));
+
+   Print("Lot                  : ",
+         DoubleToString(lot, VolumeDigits()));
+
+   Print("Risk %               : ",
+         RiskPercent);
+
+   //---------------------------------------------------------------
+   // CSV
+   //---------------------------------------------------------------
+
+   LogTradeCSV(
+      "BUY_SIGNAL",
+      pattern,
+      entry,
+      sl,
+      tp,
+      lot,
+      sweptLow,
+      targetHigh,
+      actualRR
+   );
+
+   //---------------------------------------------------------------
+   // SEND ORDER
+   //---------------------------------------------------------------
+
+   bool result =
+      trade.Buy(
+         lot,
+         TradeSymbol,
+         0.0,
+         sl,
+         tp,
+         "XAUUSD LS BUY"
+      );
+
+   if(!result)
+   {
+      Print(
+         "BUY ORDER FAILED | Retcode=",
+         trade.ResultRetcode(),
+         " | ",
+         trade.ResultRetcodeDescription()
+      );
+
+      LogTradeCSV(
+         "BUY_FAILED",
+         pattern,
+         entry,
+         sl,
+         tp,
+         lot,
+         sweptLow,
+         targetHigh,
+         actualRR
+      );
+
+      return;
+   }
+
+   Print("BUY ORDER SUCCESSFUL");
+   Print("Ticket: ", trade.ResultOrder());
+
+   LogTradeCSV(
+      "BUY_SENT",
+      pattern,
+      entry,
+      sl,
+      tp,
+      lot,
+      sweptLow,
+      targetHigh,
+      actualRR
+   );
+}
+
+//====================================================================
+// EXECUTE SELL
+//====================================================================
+
+void ExecuteSell(
+   double atr,
+   double sweptHigh,
+   string pattern
+)
+{
+   MqlTick tick;
+
+   if(!SymbolInfoTick(
+      TradeSymbol,
+      tick
+   ))
+   {
+      Print("SELL REJECTED: Cannot get tick.");
+      return;
+   }
+
+   double entry =
+      tick.bid;
+
+   //---------------------------------------------------------------
+   // SL based on swept previous HIGH
+   //---------------------------------------------------------------
+
+   double sl =
+      sweptHigh +
+      (SL_ATR_Buffer * atr);
+
+   sl =
+      NormalizePrice(sl);
+
+   if(sl <= entry)
+   {
+      Print("SELL REJECTED: SL <= Entry.");
+      return;
+   }
+
+   //---------------------------------------------------------------
+   // Previous swing LOW for TP
+   //---------------------------------------------------------------
+
+   double targetLow = 0.0;
+
+   if(!FindPreviousSwingLow(targetLow))
+   {
+      Print(
+         "SELL REJECTED: No confirmed previous swing LOW."
+      );
+
+      return;
+   }
+
+   targetLow =
+      NormalizePrice(targetLow);
+
+   //---------------------------------------------------------------
+   // Risk
+   //---------------------------------------------------------------
+
+   double riskDistance =
+      sl - entry;
+
+   if(riskDistance <= 0)
+   {
+      Print("SELL REJECTED: Invalid risk distance.");
+      return;
+   }
+
+   //---------------------------------------------------------------
+   // TP
+   //---------------------------------------------------------------
+
+   double tp =
+      targetLow;
+
+   double rewardDistance =
+      entry - tp;
+
+   if(rewardDistance <= 0)
+   {
+      Print(
+         "SELL REJECTED: Previous LOW is above entry."
+      );
+
+      return;
+   }
+
+   double actualRR =
+      rewardDistance /
+      riskDistance;
+
+   //---------------------------------------------------------------
+   // Minimum RR
+   //---------------------------------------------------------------
+
+   if(
+      RequireMinimumRR &&
+      actualRR < MinimumRiskReward
+   )
+   {
+      Print(
+         "SELL REJECTED: Previous LOW gives RR=",
+         DoubleToString(actualRR, 2),
+         " < required ",
+         DoubleToString(
+            MinimumRiskReward,
+            2
+         )
+      );
+
+      return;
+   }
+
+   //---------------------------------------------------------------
+   // Broker stop validation
+   //---------------------------------------------------------------
+
+   if(!ValidateStops(
+      ORDER_TYPE_SELL,
+      entry,
+      sl,
+      tp
+   ))
+   {
+      Print("SELL REJECTED: Broker stop-distance rule.");
+      return;
+   }
+
+   //---------------------------------------------------------------
+   // Lot
+   //---------------------------------------------------------------
+
+   double lot =
+      CalculateLotSize(
+         ORDER_TYPE_SELL,
+         entry,
+         sl
+      );
+
+   if(lot <= 0)
+   {
+      Print("SELL REJECTED: Invalid calculated lot.");
+      return;
+   }
+
+   //---------------------------------------------------------------
+   // Detailed signal
+   //---------------------------------------------------------------
+
+   Print("====================================================");
+   Print("SELL TRADE DETAILS");
+   Print("====================================================");
+
+   Print("Pattern              : ", pattern);
+
+   Print("Entry                : ",
+         DoubleToString(entry, DigitsSymbol()));
+
+   Print("Swept Previous HIGH  : ",
+         DoubleToString(sweptHigh, DigitsSymbol()));
+
+   Print("SL                   : ",
+         DoubleToString(sl, DigitsSymbol()));
+
+   Print("Previous Swing LOW   : ",
+         DoubleToString(targetLow, DigitsSymbol()));
+
+   Print("TP                   : ",
+         DoubleToString(tp, DigitsSymbol()));
+
+   Print("Risk Distance        : ",
+         DoubleToString(riskDistance, DigitsSymbol()));
+
+   Print("Reward Distance      : ",
+         DoubleToString(rewardDistance, DigitsSymbol()));
+
+   Print("RR                   : ",
+         DoubleToString(actualRR, 2));
+
+   Print("Lot                  : ",
+         DoubleToString(lot, VolumeDigits()));
+
+   //---------------------------------------------------------------
+   // CSV
+   //---------------------------------------------------------------
+
+   LogTradeCSV(
+      "SELL_SIGNAL",
+      pattern,
+      entry,
+      sl,
+      tp,
+      lot,
+      sweptHigh,
+      targetLow,
+      actualRR
+   );
+
+   //---------------------------------------------------------------
+   // SEND
+   //---------------------------------------------------------------
+
+   bool result =
+      trade.Sell(
+         lot,
+         TradeSymbol,
+         0.0,
+         sl,
+         tp,
+         "XAUUSD LS SELL"
+      );
+
+   if(!result)
+   {
+      Print(
+         "SELL ORDER FAILED | Retcode=",
+         trade.ResultRetcode(),
+         " | ",
+         trade.ResultRetcodeDescription()
+      );
+
+      LogTradeCSV(
+         "SELL_FAILED",
+         pattern,
+         entry,
+         sl,
+         tp,
+         lot,
+         sweptHigh,
+         targetLow,
+         actualRR
+      );
+
+      return;
+   }
+
+   Print("SELL ORDER SUCCESSFUL");
+   Print("Ticket: ", trade.ResultOrder());
+
+   LogTradeCSV(
+      "SELL_SENT",
+      pattern,
+      entry,
+      sl,
+      tp,
+      lot,
+      sweptHigh,
+      targetLow,
+      actualRR
+   );
+}
+
+//====================================================================
+// FIND PREVIOUS SWING HIGH
+//====================================================================
+
+bool FindPreviousSwingHigh(
+   double &swingHigh
+)
+{
+   double highs[];
+
+   ArrayResize(
+      highs,
+      SwingLookback + 10
+   );
+
+   ArraySetAsSeries(
+      highs,
+      true
+   );
+
+   int copied =
+      CopyBuffer(
+         FractalHandle,
+         0,
+         0,
+         SwingLookback + 10,
+         highs
+      );
+
+   if(copied <= 0)
+      return false;
+
+   for(int shift = 2; shift < copied; shift++)
+   {
+      if(highs[shift] == EMPTY_VALUE)
+         continue;
+
+      if(highs[shift] <= 0)
+         continue;
+
+      swingHigh = highs[shift];
+
+      return true;
+   }
+
+   return false;
+}
+
+//====================================================================
+// FIND PREVIOUS SWING LOW
+//====================================================================
+
+bool FindPreviousSwingLow(
+   double &swingLow
+)
+{
+   double lows[];
+
+   ArrayResize(
+      lows,
+      SwingLookback + 10
+   );
+
+   ArraySetAsSeries(
+      lows,
+      true
+   );
+
+   int copied =
+      CopyBuffer(
+         FractalHandle,
+         1,
+         0,
+         SwingLookback + 10,
+         lows
+      );
+
+   if(copied <= 0)
+      return false;
+
+   for(int shift = 2; shift < copied; shift++)
+   {
+      if(lows[shift] == EMPTY_VALUE)
+         continue;
+
+      if(lows[shift] <= 0)
+         continue;
+
+      swingLow = lows[shift];
+
+      return true;
+   }
+
+   return false;
+}
+
+//====================================================================
+// LOT CALCULATION
+//====================================================================
+
+double CalculateLotSize(
+   ENUM_ORDER_TYPE orderType,
+   double entry,
+   double stopLoss
+)
+{
+   double equity =
+      AccountInfoDouble(
+         ACCOUNT_EQUITY
+      );
+
+   double riskMoney =
+      equity *
+      RiskPercent /
+      100.0;
+
+   if(riskMoney <= 0)
+      return 0;
+
+   double oneLotProfit = 0.0;
+
+   if(!OrderCalcProfit(
+      orderType,
+      TradeSymbol,
+      1.0,
+      entry,
+      stopLoss,
+      oneLotProfit
+   ))
+   {
+      Print(
+         "OrderCalcProfit failed. Error=",
+         GetLastError()
+      );
+
+      return 0;
+   }
+
+   double oneLotLoss =
+      MathAbs(oneLotProfit);
+
+   if(oneLotLoss <= 0)
+      return 0;
+
+   double lot =
+      riskMoney /
+      oneLotLoss;
+
+   //---------------------------------------------------------------
+   // Broker volume limits
+   //---------------------------------------------------------------
+
+   double minLot =
+      SymbolInfoDouble(
+         TradeSymbol,
+         SYMBOL_VOLUME_MIN
+      );
+
+   double maxLot =
+      SymbolInfoDouble(
+         TradeSymbol,
+         SYMBOL_VOLUME_MAX
+      );
+
+   double step =
+      SymbolInfoDouble(
+         TradeSymbol,
+         SYMBOL_VOLUME_STEP
+      );
+
+   if(step <= 0)
+      return 0;
+
+   //---------------------------------------------------------------
+   // Safety: don't exceed maximum
+   //---------------------------------------------------------------
+
+   if(lot > maxLot)
+      lot = maxLot;
+
+   //---------------------------------------------------------------
+   // If below minimum, reject
+   //---------------------------------------------------------------
+
+   if(lot < minLot)
+   {
+      Print(
+         "Calculated lot ",
+         lot,
+         " is below broker minimum ",
+         minLot
+      );
+
+      return 0;
+   }
+
+   //---------------------------------------------------------------
+   // Round DOWN to volume step
+   //---------------------------------------------------------------
+
+   lot =
+      MathFloor(
+         lot / step
+      ) * step;
+
+   if(lot < minLot)
+      return 0;
+
+   return NormalizeVolume(lot);
+}
+
+//====================================================================
+// NORMALIZE VOLUME
+//====================================================================
+
+double NormalizeVolume(
+   double volume
+)
+{
+   double step =
+      SymbolInfoDouble(
+         TradeSymbol,
+         SYMBOL_VOLUME_STEP
+      );
+
+   if(step <= 0)
+      return volume;
+
+   int digits = 2;
+
+   if(step >= 1.0)
+      digits = 0;
+   else if(step >= 0.1)
+      digits = 1;
+   else if(step >= 0.01)
+      digits = 2;
+   else
+      digits = 3;
+
+   return NormalizeDouble(
+      volume,
+      digits
+   );
+}
+
+//====================================================================
+// VALIDATE STOPS
+//====================================================================
+
+bool ValidateStops(
+   ENUM_ORDER_TYPE orderType,
+   double entry,
+   double sl,
+   double tp
+)
+{
+   double point =
+      SymbolInfoDouble(
+         TradeSymbol,
+         SYMBOL_POINT
+      );
+
+   if(point <= 0)
+      return false;
+
+   long stopsLevel =
+      SymbolInfoInteger(
+         TradeSymbol,
+         SYMBOL_TRADE_STOPS_LEVEL
+      );
+
+   double minimumDistance =
+      stopsLevel * point;
+
+   if(orderType == ORDER_TYPE_BUY)
+   {
+      if(
+         entry - sl <
+         minimumDistance
+      )
+      {
+         Print(
+            "BUY SL too close. Required=",
+            minimumDistance
+         );
+
+         return false;
+      }
+
+      if(
+         tp - entry <
+         minimumDistance
+      )
+      {
+         Print(
+            "BUY TP too close. Required=",
+            minimumDistance
+         );
+
+         return false;
+      }
+   }
+
+   if(orderType == ORDER_TYPE_SELL)
+   {
+      if(
+         sl - entry <
+         minimumDistance
+      )
+      {
+         Print(
+            "SELL SL too close. Required=",
+            minimumDistance
+         );
+
+         return false;
+      }
+
+      if(
+         entry - tp <
+         minimumDistance
+      )
+      {
+         Print(
+            "SELL TP too close. Required=",
+            minimumDistance
+         );
+
+         return false;
+      }
+   }
+
+   return true;
+}
+
+//====================================================================
+// OPEN POSITIONS
+//====================================================================
+
+int CountOurPositions()
+{
+   int count = 0;
+
+   for(
+      int i = PositionsTotal() - 1;
+      i >= 0;
+      i--
+   )
+   {
+      ulong ticket =
+         PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(
+         !PositionSelectByTicket(ticket)
+      )
+         continue;
+
+      string symbol =
+         PositionGetString(
+            POSITION_SYMBOL
+         );
+
+      ulong magic =
+         (ulong)PositionGetInteger(
+            POSITION_MAGIC
+         );
+
+      if(
+         symbol == TradeSymbol &&
+         magic == MagicNumber
+      )
+      {
+         count++;
+      }
+   }
+
+   return count;
+}
+
+//====================================================================
+// SPREAD
+//====================================================================
+
+double GetSpreadPoints()
+{
+   MqlTick tick;
+
+   if(
+      !SymbolInfoTick(
+         TradeSymbol,
+         tick
+      )
+   )
+      return 999999;
+
+   double point =
+      SymbolInfoDouble(
+         TradeSymbol,
+         SYMBOL_POINT
+      );
+
+   if(point <= 0)
+      return 999999;
+
+   return
+      (tick.ask - tick.bid) /
+      point;
+}
+
+//====================================================================
+// SESSION
+//====================================================================
+
+bool IsTradingSession()
+{
+   MqlDateTime dt;
+
+   TimeToStruct(
+      TimeCurrent(),
+      dt
+   );
+
+   int currentMinutes =
+      dt.hour * 60 +
+      dt.min;
+
+   bool london = false;
+   bool newYork = false;
+
+   if(UseLondonSession)
+   {
+      int start =
+         ConvertTimeToMinutes(
+            LondonStart
+         );
+
+      int end =
+         ConvertTimeToMinutes(
+            LondonEnd
+         );
+
+      london =
+         IsInsideTime(
+            currentMinutes,
+            start,
+            end
+         );
+   }
+
+   if(UseNewYorkSession)
+   {
+      int start =
+         ConvertTimeToMinutes(
+            NewYorkStart
+         );
+
+      int end =
+         ConvertTimeToMinutes(
+            NewYorkEnd
+         );
+
+      newYork =
+         IsInsideTime(
+            currentMinutes,
+            start,
+            end
+         );
+   }
+
+   return london || newYork;
+}
+
+//====================================================================
+// TIME STRING
+//====================================================================
+
+int ConvertTimeToMinutes(
+   string timeText
+)
+{
+   string parts[];
+
+   int count =
+      StringSplit(
+         timeText,
+         ':',
+         parts
+      );
+
+   if(count != 2)
+      return 0;
+
+   int hour =
+      (int)StringToInteger(
+         parts[0]
+      );
+
+   int minute =
+      (int)StringToInteger(
+         parts[1]
+      );
+
+   return
+      hour * 60 +
+      minute;
+}
+
+//====================================================================
+// SESSION WINDOW
+//====================================================================
+
+bool IsInsideTime(
+   int current,
+   int start,
+   int end
+)
+{
+   if(start <= end)
+   {
+      return
+         current >= start &&
+         current <= end;
+   }
+
+   return
+      current >= start ||
+      current <= end;
+}
+
+//====================================================================
+// DAILY LOSS
+//====================================================================
+
+bool CheckDailyLoss()
+{
+   if(MaxDailyLossPercent <= 0)
+      return true;
+
+   string key =
+      "XAU_LS_START_EQ_" +
+      IntegerToString(
+         (long)AccountInfoInteger(
+            ACCOUNT_LOGIN
+         )
+      );
+
+   MqlDateTime dt;
+
+   TimeToStruct(
+      TimeCurrent(),
+      dt
+   );
+
+   string day =
+      IntegerToString(dt.year) +
+      "_" +
+      IntegerToString(dt.mon) +
+      "_" +
+      IntegerToString(dt.day);
+
+   string fullKey =
+      key + "_" + day;
+
+   //---------------------------------------------------------------
+   // First check of the day
+   //---------------------------------------------------------------
+
+   if(
+      !GlobalVariableCheck(
+         fullKey
+      )
+   )
+   {
+      GlobalVariableSet(
+         fullKey,
+         AccountInfoDouble(
+            ACCOUNT_EQUITY
+         )
+      );
+
+      return true;
+   }
+
+   double startEquity =
+      GlobalVariableGet(
+         fullKey
+      );
+
+   double currentEquity =
+      AccountInfoDouble(
+         ACCOUNT_EQUITY
+      );
+
+   if(startEquity <= 0)
+      return true;
+
+   double lossPercent =
+      (
+         (startEquity - currentEquity)
+         /
+         startEquity
+      )
+      * 100.0;
+
+   if(
+      lossPercent >=
+      MaxDailyLossPercent
+   )
+   {
+      Print(
+         "DAILY LOSS LIMIT HIT: ",
+         DoubleToString(
+            lossPercent,
+            2
+         ),
+         "%"
+      );
+
+      return false;
+   }
+
+   return true;
+}
+
+//====================================================================
+// DAILY TRADE LIMIT
+//====================================================================
+
+bool CheckDailyTradeLimit()
+{
+   if(MaxDailyTrades <= 0)
+      return true;
+
+   datetime dayStart =
+      GetDayStart();
+
+   if(
+      !HistorySelect(
+         dayStart,
+         TimeCurrent()
+      )
+   )
+      return true;
+
+   int count = 0;
+
+   int total =
+      HistoryDealsTotal();
+
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket =
+         HistoryDealGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      string symbol =
+         HistoryDealGetString(
+            ticket,
+            DEAL_SYMBOL
+         );
+
+      ulong magic =
+         (ulong)HistoryDealGetInteger(
+            ticket,
+            DEAL_MAGIC
+         );
+
+      long entry =
+         HistoryDealGetInteger(
+            ticket,
+            DEAL_ENTRY
+         );
+
+      if(
+         symbol == TradeSymbol &&
+         magic == MagicNumber &&
+         entry == DEAL_ENTRY_IN
+      )
+      {
+         count++;
+      }
+   }
+
+   return count < MaxDailyTrades;
+}
+
+//====================================================================
+// DAY START
+//====================================================================
+
+datetime GetDayStart()
+{
+   MqlDateTime dt;
+
+   TimeToStruct(
+      TimeCurrent(),
+      dt
+   );
+
+   dt.hour = 0;
+   dt.min = 0;
+   dt.sec = 0;
+
+   return StructToTime(dt);
+}
+
+//====================================================================
+// PRICE DIGITS
+//====================================================================
+
+int DigitsSymbol()
+{
+   return
+      (int)SymbolInfoInteger(
+         TradeSymbol,
+         SYMBOL_DIGITS
+      );
+}
+
+//====================================================================
+// VOLUME DIGITS
+//====================================================================
+
+int VolumeDigits()
+{
+   double step =
+      SymbolInfoDouble(
+         TradeSymbol,
+         SYMBOL_VOLUME_STEP
+      );
+
+   if(step >= 1.0)
+      return 0;
+
+   if(step >= 0.1)
+      return 1;
+
+   if(step >= 0.01)
+      return 2;
+
+   return 3;
+}
+
+//====================================================================
+// PRICE NORMALIZATION
+//====================================================================
+
+double NormalizePrice(
+   double price
+)
+{
+   return NormalizeDouble(
+      price,
+      DigitsSymbol()
+   );
+}
+
+//====================================================================
+// BOOLEAN TEXT
+//====================================================================
+
+string BoolText(
+   bool value
+)
+{
+   return value ? "YES" : "NO";
+}
+
+//====================================================================
+// MARKET STATE LOG
+//====================================================================
+
+void LogMarketState(
+   double ema20,
+   double ema50,
+   double ema200,
+   double rsi,
+   double atr,
+   double open,
+   double high,
+   double low,
+   double close,
+   double spread
+)
+{
+   if(!EnableDetailedLogging)
+      return;
+
+   Print(
+      "MARKET STATE | ",
+      "EMA20=",
+      DoubleToString(ema20, DigitsSymbol()),
+      " | EMA50=",
+      DoubleToString(ema50, DigitsSymbol()),
+      " | EMA200=",
+      DoubleToString(ema200, DigitsSymbol()),
+      " | RSI=",
+      DoubleToString(rsi, 2),
+      " | ATR=",
+      DoubleToString(atr, DigitsSymbol()),
+      " | OHLC=",
+      DoubleToString(open, DigitsSymbol()),
+      "/",
+      DoubleToString(high, DigitsSymbol()),
+      "/",
+      DoubleToString(low, DigitsSymbol()),
+      "/",
+      DoubleToString(close, DigitsSymbol()),
+      " | Spread=",
+      DoubleToString(spread, 1)
+   );
+}
+
+//====================================================================
+// CSV LOG
+//====================================================================
+
+void LogTradeCSV(
+   string action,
+   string pattern,
+   double entry,
+   double sl,
+   double tp,
+   double lot,
+   double referenceLevel,
+   double targetLevel,
+   double rr
+)
+{
+   if(!EnableCSVLogging)
+      return;
+
+   int file =
+      FileOpen(
+         CSVFileName,
+         FILE_READ |
+         FILE_WRITE |
+         FILE_CSV |
+         FILE_SHARE_READ |
+         FILE_SHARE_WRITE,
+         ','
+      );
+
+   if(file == INVALID_HANDLE)
+   {
+      Print(
+         "CSV open failed. Error=",
+         GetLastError()
+      );
+
+      return;
+   }
+
+   //---------------------------------------------------------------
+   // Header
+   //---------------------------------------------------------------
+
+   if(FileSize(file) == 0)
+   {
+      FileWrite(
+         file,
+         "Time",
+         "Symbol",
+         "Action",
+         "Pattern",
+         "Entry",
+         "SL",
+         "TP",
+         "Lot",
+         "ReferenceLevel",
+         "TargetLevel",
+         "RR",
+         "SpreadPoints"
+      );
+   }
+
+   FileSeek(
+      file,
+      0,
+      SEEK_END
+   );
+
+   FileWrite(
+      file,
+      TimeToString(
+         TimeCurrent(),
+         TIME_DATE |
+         TIME_SECONDS
+      ),
+      TradeSymbol,
+      action,
+      pattern,
+      DoubleToString(
+         entry,
+         DigitsSymbol()
+      ),
+      DoubleToString(
+         sl,
+         DigitsSymbol()
+      ),
+      DoubleToString(
+         tp,
+         DigitsSymbol()
+      ),
+      DoubleToString(
+         lot,
+         VolumeDigits()
+      ),
+      DoubleToString(
+         referenceLevel,
+         DigitsSymbol()
+      ),
+      DoubleToString(
+         targetLevel,
+         DigitsSymbol()
+      ),
+      DoubleToString(
+         rr,
+         2
+      ),
+      DoubleToString(
+         GetSpreadPoints(),
+         1
+      )
+   );
+
+   FileClose(file);
+}
+//+------------------------------------------------------------------+

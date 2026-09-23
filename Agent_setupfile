@@ -1,0 +1,47 @@
+#!/bin/bash
+
+# ============================================
+# CloudWatch Agent - Config Setup & Start
+# ============================================
+
+sudo tee /opt/aws/amazon-cloudwatch-agent/bin/config.json > /dev/null <<'EOF'
+{
+  "agent": {
+    "metrics_collection_interval": 60,
+    "run_as_user": "root"
+  },
+  "metrics": {
+    "namespace": "CWAgent",
+    "append_dimensions": {
+      "InstanceId": "${aws:InstanceId}"
+    },
+    "metrics_collected": {
+      "cpu": {
+        "measurement": [
+          "cpu_usage_active"
+        ],
+        "metrics_collection_interval": 60,
+        "totalcpu": true
+      }
+    }
+  }
+}
+EOF
+
+echo "✅ Config file saved to /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json"
+
+# Step 2: Load the config and start the agent
+sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config \
+  -m ec2 \
+  -s \
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+
+echo "✅ CloudWatch Agent started with the new configuration"
+
+# Step 3: Verify the agent status
+sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a status
+
+echo "✅ Agent status displayed above"
+

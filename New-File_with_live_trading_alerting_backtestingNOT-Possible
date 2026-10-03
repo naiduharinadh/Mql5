@@ -1,0 +1,767 @@
+
+//+------------------------------------------------------------------+
+//|                                EMA_9_21_Crossover_v4_Final.mq5   |
+//|     9 & 21 EMA Crossover - v4 Final                               |
+//|     - Take profit at $ target automatically                       |
+//|     - Profit-only close on opposite signal                        |
+//|     - ALERT if loss > $50 OR in loss > 4 hours                   |
+//|     - EA PAUSES all trading after alert                           |
+//|     - Alerts work in BOTH backtesting and live trading            |
+//|     - NO stop loss, NO parallel trades                            |
+//+------------------------------------------------------------------+
+#property copyright "EMA Crossover EA v4 Final"
+#property version   "4.20"
+#property strict
+
+//=== CORE STRATEGY ===
+input int      EMA_Fast_Period        = 9;              // Fast EMA Period
+input int      EMA_Slow_Period        = 21;             // Slow EMA Period
+input double   LotSize               = 0.1;            // Trade Lot Size
+input int      MagicNumber           = 92121;           // EA Magic Number
+
+//=== PROFIT MANAGEMENT ===
+input double   TakeProfit_Dollar      = 65.0;           // Take Profit $ (auto-exit)
+input double   MinProfitToClose       = 0.0;            // Min profit to close on opposite signal
+
+//=== ALERT & PAUSE SETTINGS ===
+input double   AlertLossDollar        = 50.0;           // Alert if loss exceeds this $ amount
+input double   AlertLossHours         = 4.0;            // Alert if in ANY loss for more than X hours
+input double   AlertRepeatMinutes     = 5.0;            // Re-send alert every X minutes
+input bool     SendEmailAlert         = true;           // Send email alert (LIVE only)
+input bool     SendPushAlert          = true;           // Send push notification (LIVE only)
+input bool     SendPopupAlert         = true;           // Show popup alert (LIVE only)
+
+//=== FILTERS ===
+input bool     TrendFilter            = true;           // Price must be on correct side of EMAs
+input int      MinBarsBetweenTrades   = 2;              // Min bars between trades (anti-whipsaw)
+input ENUM_TIMEFRAMES Timeframe       = PERIOD_CURRENT; // Timeframe
+
+//=== GLOBAL VARIABLES ===
+int    handleFastEMA;
+int    handleSlowEMA;
+double fastEMA[];
+double slowEMA[];
+
+datetime lastBarTime           = 0;
+datetime lastTradeBarTime      = 0;
+int      pendingSignal         = 0;
+bool     waitingForProfitClose = false;
+int      lastTrendDirection    = 0;
+
+//=== ALERT & PAUSE STATE ===
+bool     eaPaused              = false;
+ulong    problemTicket         = 0;
+datetime lastAlertSentTime     = 0;
+bool     firstAlertSent        = false;
+bool     isTesting             = false;   // Detect if running in Strategy Tester
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                              |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   handleFastEMA = iMA(_Symbol, Timeframe, EMA_Fast_Period, 0, MODE_EMA, PRICE_CLOSE);
+   handleSlowEMA = iMA(_Symbol, Timeframe, EMA_Slow_Period, 0, MODE_EMA, PRICE_CLOSE);
+
+   if(handleFastEMA == INVALID_HANDLE || handleSlowEMA == INVALID_HANDLE)
+   {
+      Print("ERROR: Failed to create EMA handles!");
+      return(INIT_FAILED);
+   }
+
+   ArraySetAsSeries(fastEMA, true);
+   ArraySetAsSeries(slowEMA, true);
+
+   //--- Detect if running in Strategy Tester
+   isTesting = MQLInfoInteger(MQL_TESTER);
+
+   //--- Reset states
+   eaPaused          = false;
+   problemTicket     = 0;
+   lastAlertSentTime = 0;
+   firstAlertSent    = false;
+
+   //--- Initial trend
+   if(CopyBuffer(handleFastEMA, 0, 0, 3, fastEMA) >= 3 &&
+      CopyBuffer(handleSlowEMA, 0, 0, 3, slowEMA) >= 3)
+   {
+      lastTrendDirection = (fastEMA[1] > slowEMA[1]) ? 1 : -1;
+   }
+
+   Print("=============================================");
+   Print("=== EMA 9/21 Crossover EA v4 FINAL ===");
+   Print("=============================================");
+   Print("MODE: ", isTesting ? "⚙️ BACKTESTING (Visual alerts ON)" : "🔴 LIVE TRADING");
+   Print("EMAs: ", EMA_Fast_Period, "/", EMA_Slow_Period, " | Lot: ", LotSize);
+   Print("Take Profit: $", TakeProfit_Dollar);
+   Print("--- ALERT SETTINGS ---");
+   Print("  Alert if loss > $", AlertLossDollar);
+   Print("  Alert if in ANY loss > ", AlertLossHours, " hours");
+   Print("  Re-alert every ", AlertRepeatMinutes, " minutes");
+   if(isTesting)
+   {
+      Print("  *** BACKTEST MODE: Alerts via Chart + Journal ***");
+      Print("  *** Run in VISUAL MODE to see on-chart alerts ***");
+   }
+   Print("=============================================");
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                            |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   //--- Clean up chart objects
+   ObjectsDeleteAll(0, "EA_ALERT_");
+   Comment("");  // Clear any on-chart comments
+
+   if(handleFastEMA != INVALID_HANDLE) IndicatorRelease(handleFastEMA);
+   if(handleSlowEMA != INVALID_HANDLE) IndicatorRelease(handleSlowEMA);
+   Print("=== EA v4 Final Removed ===");
+}
+
+//+------------------------------------------------------------------+
+//| MAIN TICK FUNCTION                                                 |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   //=== PHASE 1: CHECK IF EA IS PAUSED ===
+   if(eaPaused)
+   {
+      HandlePausedState();
+      return;
+   }
+
+   //=== PHASE 2: MONITOR FOR PROBLEM TRADES ===
+   if(CheckForProblemTrade()) return;
+
+   //=== PHASE 3: TAKE PROFIT ===
+   CheckTakeProfitOnTick();
+
+   //=== PHASE 4: PENDING PROFIT CLOSE ===
+   if(waitingForProfitClose && pendingSignal != 0)
+      HandlePendingProfitClose();
+
+   //=== PHASE 5: CROSSOVER DETECTION ===
+   datetime currentBarTime = iTime(_Symbol, Timeframe, 0);
+   if(currentBarTime == lastBarTime) return;
+   lastBarTime = currentBarTime;
+
+   if(CopyBuffer(handleFastEMA, 0, 0, 3, fastEMA) < 3) return;
+   if(CopyBuffer(handleSlowEMA, 0, 0, 3, slowEMA) < 3) return;
+
+   double fastCurr   = fastEMA[1];
+   double fastPrev   = fastEMA[2];
+   double slowCurr   = slowEMA[1];
+   double slowPrev   = slowEMA[2];
+   double closePrice = iClose(_Symbol, Timeframe, 1);
+
+   bool bullishCross = (fastPrev <= slowPrev) && (fastCurr > slowCurr);
+   bool bearishCross = (fastPrev >= slowPrev) && (fastCurr < slowCurr);
+
+   if(fastCurr > slowCurr) lastTrendDirection = 1;
+   else if(fastCurr < slowCurr) lastTrendDirection = -1;
+
+   if(TrendFilter)
+   {
+      if(bullishCross && closePrice < MathMin(fastCurr, slowCurr))
+      { Print("FILTERED: Bullish - price below EMAs"); bullishCross = false; }
+      if(bearishCross && closePrice > MathMax(fastCurr, slowCurr))
+      { Print("FILTERED: Bearish - price above EMAs"); bearishCross = false; }
+   }
+
+   if((bullishCross || bearishCross) && lastTradeBarTime != 0)
+   {
+      int barsSince = Bars(_Symbol, Timeframe, lastTradeBarTime, currentBarTime) - 1;
+      if(barsSince < MinBarsBetweenTrades)
+      { Print("FILTERED: ", barsSince, " bars (need ", MinBarsBetweenTrades, ")"); return; }
+   }
+
+   if(bullishCross)
+   {
+      Print("=== BULLISH CROSSOVER ===");
+      HandleCrossoverSignal(1, currentBarTime);
+   }
+   if(bearishCross)
+   {
+      Print("=== BEARISH CROSSOVER ===");
+      HandleCrossoverSignal(-1, currentBarTime);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| CHECK FOR PROBLEM TRADE — Triggers alert + pause                  |
+//+------------------------------------------------------------------+
+bool CheckForProblemTrade()
+{
+   datetime now = TimeCurrent();
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+
+      double profit     = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+      datetime openTime = (datetime)PositionGetInteger(POSITION_TIME);
+      double hoursOpen  = (double)(now - openTime) / 3600.0;
+      double openPrice  = PositionGetDouble(POSITION_PRICE_OPEN);
+      double curPrice   = PositionGetDouble(POSITION_PRICE_CURRENT);
+
+      ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      string dir = (posType == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+
+      bool lossExceedsLimit = (profit <= -AlertLossDollar);
+      bool inLossTooLong    = (profit < 0 && hoursOpen >= AlertLossHours);
+
+      if(lossExceedsLimit || inLossTooLong)
+      {
+         eaPaused      = true;
+         problemTicket = ticket;
+         pendingSignal = 0;
+         waitingForProfitClose = false;
+
+         string reason = "";
+         if(lossExceedsLimit && inLossTooLong)
+            reason = "Loss -$" + DoubleToString(MathAbs(profit), 2) +
+                     " exceeds $" + DoubleToString(AlertLossDollar, 2) +
+                     " AND in loss for " + DoubleToString(hoursOpen, 1) + "h";
+         else if(lossExceedsLimit)
+            reason = "Loss -$" + DoubleToString(MathAbs(profit), 2) +
+                     " exceeds limit $" + DoubleToString(AlertLossDollar, 2);
+         else
+            reason = "In loss -$" + DoubleToString(MathAbs(profit), 2) +
+                     " for " + DoubleToString(hoursOpen, 1) + "h (limit " +
+                     DoubleToString(AlertLossHours, 1) + "h)";
+
+         //--- Send alert through ALL channels
+         SendFullAlert(ticket, dir, profit, hoursOpen, openPrice, curPrice, reason, true);
+         firstAlertSent    = true;
+         lastAlertSentTime = now;
+
+         return true;
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| HANDLE PAUSED STATE — Repeat alerts until user acts               |
+//+------------------------------------------------------------------+
+void HandlePausedState()
+{
+   datetime now = TimeCurrent();
+
+   bool stillOpen = false;
+   double currentProfit = 0;
+   double hoursOpen = 0;
+   double openPrice = 0;
+   double curPrice = 0;
+   string dir = "";
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+
+      if(ticket == problemTicket)
+      {
+         stillOpen     = true;
+         currentProfit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+         openPrice     = PositionGetDouble(POSITION_PRICE_OPEN);
+         curPrice      = PositionGetDouble(POSITION_PRICE_CURRENT);
+         datetime oTime = (datetime)PositionGetInteger(POSITION_TIME);
+         hoursOpen = (double)(now - oTime) / 3600.0;
+         ENUM_POSITION_TYPE pt = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+         dir = (pt == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+         break;
+      }
+   }
+
+   if(stillOpen)
+   {
+      //--- Keep showing on-chart message (always visible in backtest visual mode)
+      ShowChartAlert(problemTicket, dir, currentProfit, hoursOpen, openPrice, curPrice, true);
+
+      //--- Re-alert every X minutes
+      double minSinceAlert = (double)(now - lastAlertSentTime) / 60.0;
+      if(minSinceAlert >= AlertRepeatMinutes)
+      {
+         string reason = "REMINDER — Still open. Loss: -$" +
+                         DoubleToString(MathAbs(currentProfit), 2) +
+                         " | " + DoubleToString(hoursOpen, 1) + "h";
+
+         SendFullAlert(problemTicket, dir, currentProfit, hoursOpen,
+                       openPrice, curPrice, reason, false);
+         lastAlertSentTime = now;
+      }
+   }
+   else
+   {
+      //--- Trade was closed by user
+      Print("=============================================");
+      Print("=== ✅ TRADE #", problemTicket, " CLOSED BY USER ===");
+      Print("=== ⏸️ EA STILL PAUSED — RESTART TO RESUME ===");
+      Print("=============================================");
+
+      //--- Show final message on chart
+      string finalMsg = "\n"
+         "======================================\n"
+         "  ✅ TRADE #" + IntegerToString(problemTicket) + " CLOSED!\n"
+         "======================================\n\n"
+         "  EA is PAUSED.\n\n"
+         "  TO RESUME TRADING:\n"
+         "  1. Right-click chart\n"
+         "  2. Expert Advisors > Remove\n"
+         "  3. Drag EA back onto chart\n"
+         "  4. Trading resumes automatically\n"
+         "======================================";
+
+      Comment(finalMsg);
+
+      //--- Live-only alerts
+      if(!isTesting)
+      {
+         if(SendPopupAlert)
+            Alert("✅ Trade #", problemTicket, " closed! Restart EA to resume trading.");
+         if(SendEmailAlert)
+            SendMail("✅ Trade Closed - Restart EA",
+                     "Trade #" + IntegerToString(problemTicket) + " closed.\n" +
+                     "Restart EA to resume trading.\nSymbol: " + _Symbol);
+         if(SendPushAlert)
+            SendNotification("✅ " + _Symbol + " #" + IntegerToString(problemTicket) +
+                             " closed. Restart EA.");
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| SEND FULL ALERT — Works in BOTH backtest and live                 |
+//+------------------------------------------------------------------+
+void SendFullAlert(ulong ticket, string direction, double profit,
+                   double hoursOpen, double openPrice, double curPrice,
+                   string reason, bool isFirst)
+{
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+
+   //=== 1. JOURNAL LOG (works in BOTH backtest and live) ===
+   Print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+   Print("!! ⚠️ ", isFirst ? "TRADE ALERT" : "REMINDER",
+         " — EA PAUSED !!");
+   Print("!! Ticket:  #", ticket);
+   Print("!! Symbol:  ", _Symbol);
+   Print("!! Type:    ", direction);
+   Print("!! Open:    ", DoubleToString(openPrice, digits));
+   Print("!! Current: ", DoubleToString(curPrice, digits));
+   Print("!! Loss:    -$", DoubleToString(MathAbs(profit), 2));
+   Print("!! Hours:   ", DoubleToString(hoursOpen, 1));
+   Print("!! Reason:  ", reason);
+   Print("!! Status:  EA PAUSED — No new trades");
+   Print("!! Action:  Close manually, restart EA");
+   Print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+
+   //=== 2. ON-CHART COMMENT (works in BOTH backtest visual mode and live) ===
+   ShowChartAlert(ticket, direction, profit, hoursOpen, openPrice, curPrice, isFirst);
+
+   //=== 3. CHART ARROW MARKER (visible in backtest chart) ===
+   DrawAlertMarker(ticket, direction, curPrice);
+
+   //=== 4. LIVE-ONLY: Popup, Email, Push ===
+   if(!isTesting)
+   {
+      //--- Popup Alert
+      if(SendPopupAlert)
+      {
+         if(isFirst)
+         {
+            Alert(
+               "⚠️ TRADE ALERT — ACTION REQUIRED ⚠️\n\n",
+               "Symbol: ", _Symbol, "\n",
+               "Ticket: #", ticket, "\n",
+               "Direction: ", direction, "\n",
+               "Open Price: ", DoubleToString(openPrice, digits), "\n",
+               "Current Price: ", DoubleToString(curPrice, digits), "\n",
+               "Current Loss: -$", DoubleToString(MathAbs(profit), 2), "\n",
+               "Hours Open: ", DoubleToString(hoursOpen, 1), "\n\n",
+               "Reason: ", reason, "\n\n",
+               "⏸️ EA IS NOW PAUSED — NO NEW TRADES\n\n",
+               "OPTIONS:\n",
+               "1. CLOSE the trade manually with minimal loss\n",
+               "2. WAIT — reminder every ",
+                    DoubleToString(AlertRepeatMinutes, 0), " min\n\n",
+               "After closing → RESTART EA to resume");
+         }
+         else
+         {
+            Alert(
+               "🔔 REMINDER — Trade #", ticket, " still open!\n",
+               direction, " | Loss: -$", DoubleToString(MathAbs(profit), 2),
+               " | ", DoubleToString(hoursOpen, 1), "h\n",
+               "CLOSE manually → RESTART EA");
+         }
+      }
+
+      //--- Email Alert
+      if(SendEmailAlert)
+      {
+         string subject = (isFirst ? "⚠️ ALERT: " : "🔔 REMINDER: ") +
+                          _Symbol + " " + direction +
+                          " -$" + DoubleToString(MathAbs(profit), 2);
+
+         string body = "==========================================\n";
+         body += isFirst ? "  ⚠️ TRADE ALERT — ACTION REQUIRED\n" :
+                           "  🔔 TRADE REMINDER\n";
+         body += "==========================================\n\n";
+         body += "Symbol:         " + _Symbol + "\n";
+         body += "Ticket:         #" + IntegerToString(ticket) + "\n";
+         body += "Direction:      " + direction + "\n";
+         body += "Open Price:     " + DoubleToString(openPrice, digits) + "\n";
+         body += "Current Price:  " + DoubleToString(curPrice, digits) + "\n";
+         body += "Current Loss:   -$" + DoubleToString(MathAbs(profit), 2) + "\n";
+         body += "Hours Open:     " + DoubleToString(hoursOpen, 1) + "\n";
+         body += "Alert Time:     " + TimeToString(TimeCurrent(), TIME_DATE|TIME_MINUTES) + "\n\n";
+         body += "Reason: " + reason + "\n\n";
+         body += "==========================================\n";
+         body += "  EA STATUS: ⏸️ PAUSED\n";
+         body += "  Close trade manually → Restart EA\n";
+         body += "==========================================\n";
+
+         if(!SendMail(subject, body))
+            Print("WARNING: Email failed");
+      }
+
+      //--- Push Notification
+      if(SendPushAlert)
+      {
+         string push = (isFirst ? "⚠️ " : "🔔 ") +
+                       _Symbol + " " + direction +
+                       " #" + IntegerToString(ticket) +
+                       " Loss:-$" + DoubleToString(MathAbs(profit), 2) +
+                       " " + DoubleToString(hoursOpen, 1) + "h. EA PAUSED.";
+
+         if(!SendNotification(push))
+            Print("WARNING: Push failed");
+      }
+   }
+   else
+   {
+      //--- In backtesting, remind user to check journal
+      Print(">> [BACKTEST] Alert displayed on chart. Check VISUAL MODE to see it.");
+      Print(">> [BACKTEST] In live trading, you will get: Popup + Email + Push");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| SHOW ON-CHART ALERT MESSAGE                                        |
+//| This is visible in Strategy Tester Visual Mode AND live           |
+//+------------------------------------------------------------------+
+void ShowChartAlert(ulong ticket, string direction, double profit,
+                    double hoursOpen, double openPrice, double curPrice,
+                    bool isFirst)
+{
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+
+   string msg = "\n";
+   msg += "╔══════════════════════════════════════════╗\n";
+
+   if(isFirst)
+      msg += "║   ⚠️  TRADE ALERT — EA PAUSED  ⚠️        ║\n";
+   else
+      msg += "║   🔔  REMINDER — EA STILL PAUSED  🔔     ║\n";
+
+   msg += "╠══════════════════════════════════════════╣\n";
+   msg += "║                                          ║\n";
+   msg += "║  Symbol:    " + _Symbol + "                     \n";
+   msg += "║  Ticket:    #" + IntegerToString(ticket) + "                         \n";
+   msg += "║  Direction: " + direction + "                          \n";
+   msg += "║  Open:      " + DoubleToString(openPrice, digits) + "                \n";
+   msg += "║  Current:   " + DoubleToString(curPrice, digits) + "                \n";
+   msg += "║  Loss:      -$" + DoubleToString(MathAbs(profit), 2) + "                    \n";
+   msg += "║  Hours:     " + DoubleToString(hoursOpen, 1) + "h                       \n";
+   msg += "║                                          ║\n";
+   msg += "╠══════════════════════════════════════════╣\n";
+   msg += "║  ⏸️ NO NEW TRADES WILL BE PLACED         ║\n";
+   msg += "║                                          ║\n";
+   msg += "║  YOUR OPTIONS:                           ║\n";
+   msg += "║  1. CLOSE trade manually                 ║\n";
+   msg += "║  2. WAIT — reminder every " +
+          DoubleToString(AlertRepeatMinutes, 0) + " min       ║\n";
+   msg += "║                                          ║\n";
+   msg += "║  After close → RESTART EA to resume      ║\n";
+   msg += "╚══════════════════════════════════════════╝\n";
+   msg += "\n  Time: " + TimeToString(TimeCurrent(), TIME_DATE | TIME_MINUTES);
+
+   Comment(msg);
+}
+
+//+------------------------------------------------------------------+
+//| DRAW ALERT MARKER on chart (red arrow at alert point)            |
+//+------------------------------------------------------------------+
+void DrawAlertMarker(ulong ticket, string direction, double price)
+{
+   string name = "EA_ALERT_" + IntegerToString(ticket) + "_" +
+                 IntegerToString(TimeCurrent());
+
+   if(ObjectFind(0, name) >= 0) return;
+
+   datetime time = TimeCurrent();
+
+   //--- Draw red arrow at alert point
+   ObjectCreate(0, name, OBJ_ARROW, 0, time, price);
+   ObjectSetInteger(0, name, OBJPROP_ARROWCODE, 251);       // Warning symbol
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clrRed);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, 3);
+   ObjectSetString(0, name, OBJPROP_TOOLTIP,
+                   "⚠️ ALERT: " + direction + " #" + IntegerToString(ticket) +
+                   " | Loss triggered pause");
+
+   //--- Also draw a text label
+   string labelName = "EA_ALERT_TXT_" + IntegerToString(ticket);
+   if(ObjectFind(0, labelName) < 0)
+   {
+      ObjectCreate(0, labelName, OBJ_TEXT, 0, time, price);
+      ObjectSetString(0, labelName, OBJPROP_TEXT,
+                      " ⚠️ PAUSED: " + direction + " #" + IntegerToString(ticket));
+      ObjectSetInteger(0, labelName, OBJPROP_COLOR, clrRed);
+      ObjectSetInteger(0, labelName, OBJPROP_FONTSIZE, 10);
+   }
+
+   ChartRedraw(0);
+}
+
+//+------------------------------------------------------------------+
+//| TAKE PROFIT CHECK                                                  |
+//+------------------------------------------------------------------+
+void CheckTakeProfitOnTick()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+
+      double profit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+      ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+      if(profit >= TakeProfit_Dollar)
+      {
+         string dir = (posType == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+         Print("$$$ TAKE PROFIT! ", dir, " #", ticket,
+               " | Profit: $", DoubleToString(profit, 2));
+
+         ClosePosition(ticket, posType);
+
+         if(CopyBuffer(handleFastEMA, 0, 0, 2, fastEMA) >= 2 &&
+            CopyBuffer(handleSlowEMA, 0, 0, 2, slowEMA) >= 2)
+         {
+            if(fastEMA[0] > slowEMA[0] && !HasOpenPosition(POSITION_TYPE_BUY))
+            { Print("  >> Re-entering BUY"); OpenTrade(ORDER_TYPE_BUY);
+              lastTradeBarTime = iTime(_Symbol, Timeframe, 0); }
+            else if(fastEMA[0] < slowEMA[0] && !HasOpenPosition(POSITION_TYPE_SELL))
+            { Print("  >> Re-entering SELL"); OpenTrade(ORDER_TYPE_SELL);
+              lastTradeBarTime = iTime(_Symbol, Timeframe, 0); }
+         }
+         return;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Handle pending profit close                                        |
+//+------------------------------------------------------------------+
+void HandlePendingProfitClose()
+{
+   ENUM_POSITION_TYPE oldPosType = (pendingSignal == 1) ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
+
+   if(HasOpenPosition(oldPosType))
+   {
+      double posProfit = GetPositionProfit(oldPosType);
+      if(posProfit >= MinProfitToClose)
+      {
+         Print(">>> Position profitable ($", DoubleToString(posProfit, 2), ") → Closing");
+         CloseAllPositions(oldPosType);
+
+         if(pendingSignal == 1 && !HasOpenPosition(POSITION_TYPE_BUY))
+            OpenTrade(ORDER_TYPE_BUY);
+         else if(pendingSignal == -1 && !HasOpenPosition(POSITION_TYPE_SELL))
+            OpenTrade(ORDER_TYPE_SELL);
+
+         pendingSignal = 0; waitingForProfitClose = false;
+         lastTradeBarTime = iTime(_Symbol, Timeframe, 0);
+      }
+   }
+   else
+   {
+      if(pendingSignal == 1 && !HasOpenPosition(POSITION_TYPE_BUY))
+         OpenTrade(ORDER_TYPE_BUY);
+      else if(pendingSignal == -1 && !HasOpenPosition(POSITION_TYPE_SELL))
+         OpenTrade(ORDER_TYPE_SELL);
+
+      pendingSignal = 0; waitingForProfitClose = false;
+      lastTradeBarTime = iTime(_Symbol, Timeframe, 0);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Handle crossover signal                                            |
+//+------------------------------------------------------------------+
+void HandleCrossoverSignal(int direction, datetime barTime)
+{
+   ENUM_POSITION_TYPE wantedPos   = (direction == 1) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+   ENUM_POSITION_TYPE oppositePos = (direction == 1) ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
+   ENUM_ORDER_TYPE    orderType   = (direction == 1) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   string dirName = (direction == 1) ? "BUY" : "SELL";
+
+   if(HasOpenPosition(wantedPos))
+   { Print("  Already in ", dirName, ". Skip."); return; }
+
+   if(HasOpenPosition(oppositePos))
+   {
+      double oppProfit = GetPositionProfit(oppositePos);
+      if(oppProfit >= MinProfitToClose)
+      {
+         Print("  Opposite in profit → Close & open ", dirName);
+         CloseAllPositions(oppositePos);
+         OpenTrade(orderType);
+         lastTradeBarTime = barTime;
+      }
+      else
+      {
+         Print("  Opposite in loss → Queuing ", dirName);
+         pendingSignal = direction; waitingForProfitClose = true;
+      }
+   }
+   else
+   { OpenTrade(orderType); lastTradeBarTime = barTime; }
+}
+
+//+------------------------------------------------------------------+
+//| OPEN TRADE                                                         |
+//+------------------------------------------------------------------+
+bool OpenTrade(ENUM_ORDER_TYPE orderType)
+{
+   if(orderType == ORDER_TYPE_BUY && HasOpenPosition(POSITION_TYPE_BUY)) return false;
+   if(orderType == ORDER_TYPE_SELL && HasOpenPosition(POSITION_TYPE_SELL)) return false;
+
+   MqlTradeRequest request = {};
+   MqlTradeResult  result  = {};
+
+   request.action = TRADE_ACTION_DEAL; request.symbol = _Symbol;
+   request.volume = LotSize; request.type = orderType;
+   request.deviation = 10; request.magic = MagicNumber;
+   request.sl = 0; request.tp = 0;
+
+   string direction;
+   if(orderType == ORDER_TYPE_BUY)
+   {
+      request.price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      direction = "BUY";
+      request.comment = "EMA_" + IntegerToString(EMA_Fast_Period) + "_" +
+                        IntegerToString(EMA_Slow_Period) + "_BUY";
+   }
+   else
+   {
+      request.price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      direction = "SELL";
+      request.comment = "EMA_" + IntegerToString(EMA_Fast_Period) + "_" +
+                        IntegerToString(EMA_Slow_Period) + "_SELL";
+   }
+
+   request.type_filling = GetFillingMode();
+
+   if(!OrderSend(request, result))
+   { Print("ERROR: ", GetLastError()); return false; }
+
+   if(result.retcode == TRADE_RETCODE_DONE || result.retcode == TRADE_RETCODE_PLACED)
+   { Print("*** OPENED ", direction, " @ ", result.price, " | #", result.order); return true; }
+
+   Print("ERROR: Retcode ", result.retcode);
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| CLOSE POSITION                                                     |
+//+------------------------------------------------------------------+
+void ClosePosition(ulong ticket, ENUM_POSITION_TYPE posType)
+{
+   MqlTradeRequest request = {};
+   MqlTradeResult  result  = {};
+   if(!PositionSelectByTicket(ticket)) return;
+
+   request.action = TRADE_ACTION_DEAL; request.symbol = _Symbol;
+   request.volume = PositionGetDouble(POSITION_VOLUME);
+   request.deviation = 10; request.magic = MagicNumber;
+   request.position = ticket; request.comment = "EMA_Close";
+
+   if(posType == POSITION_TYPE_BUY)
+   { request.type = ORDER_TYPE_SELL; request.price = SymbolInfoDouble(_Symbol, SYMBOL_BID); }
+   else
+   { request.type = ORDER_TYPE_BUY; request.price = SymbolInfoDouble(_Symbol, SYMBOL_ASK); }
+
+   request.type_filling = GetFillingMode();
+
+   if(!OrderSend(request, result))
+      Print("ERROR: Close #", ticket, " | ", GetLastError());
+   else
+      Print("*** CLOSED #", ticket, " @ ", result.price);
+}
+
+void CloseAllPositions(ENUM_POSITION_TYPE posType)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != posType) continue;
+      ClosePosition(ticket, posType);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| HELPERS                                                            |
+//+------------------------------------------------------------------+
+bool HasOpenPosition(ENUM_POSITION_TYPE posType)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == posType) return true;
+   }
+   return false;
+}
+
+double GetPositionProfit(ENUM_POSITION_TYPE posType)
+{
+   double t = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == posType)
+      { t += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP); }
+   }
+   return t;
+}
+
+ENUM_ORDER_TYPE_FILLING GetFillingMode()
+{
+   long fm = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   if((fm & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK) return ORDER_FILLING_FOK;
+   if((fm & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC) return ORDER_FILLING_IOC;
+   return ORDER_FILLING_RETURN;
+}
+//+------------------------------------------------------------------+
+

@@ -1,0 +1,871 @@
+
+// It will close the position if and only if trade is profitable and it don't close until unless trade profitable. Issue is if the trade went into loss it will stay in that trade only and it will make that other trades won't get executed. some we need to confgure the alert if loss is more than 30$ or if the trade is is loss more than 4 hours like that and exit the trade manually and restart the bot again.
+
+
+
+
+//+------------------------------------------------------------------+
+
+//| EMA_9_21_Crossover_v3.mq5 |
+
+//| 9 & 21 EMA Crossover - Profit Target + Profit-Only Exit |
+
+//| - Takes profit at $60-70 automatically |
+
+//| - Only closes on opposite signal if in profit |
+
+//| - Opens new trade immediately after any close |
+
+//+------------------------------------------------------------------+
+
+#property copyright "EMA Crossover EA v3"
+
+#property version "3.00"
+
+#property strict
+
+//--- Input Parameters
+
+input int EMA_Fast_Period = 9; // Fast EMA Period
+
+input int EMA_Slow_Period = 21; // Slow EMA Period
+
+input double LotSize = 0.1; // Trade Lot Size
+
+input int MagicNumber = 92121; // EA Magic Number
+
+//--- Profit Management
+
+input double TakeProfit_Dollar = 65.0; // Take Profit in $ (auto-exit at this profit)
+
+input double MinProfitToClose = 0.0; // Min profit ($) to close on opposite signal (0=breakeven)
+
+//--- Filters
+
+input bool TrendFilter = true; // Price must be on correct side of EMAs
+
+input int MinBarsBetweenTrades = 2; // Min bars between trades (anti-whipsaw)
+
+input ENUM_TIMEFRAMES Timeframe = PERIOD_CURRENT; // Timeframe
+
+//--- Global Variables
+
+int handleFastEMA;
+
+int handleSlowEMA;
+
+double fastEMA[];
+
+double slowEMA[];
+
+datetime lastBarTime = 0;
+
+datetime lastTradeBarTime = 0;
+
+int pendingSignal = 0; // +1 = pending BUY, -1 = pending SELL
+
+bool waitingForProfitClose = false;
+
+int lastTrendDirection = 0; // +1 = bullish, -1 = bearish (tracks EMA state)
+
+//+------------------------------------------------------------------+
+
+//| Expert initialization function |
+
+//+------------------------------------------------------------------+
+
+int OnInit()
+
+{
+
+handleFastEMA = iMA(_Symbol, Timeframe, EMA_Fast_Period, 0, MODE_EMA, PRICE_CLOSE);
+
+handleSlowEMA = iMA(_Symbol, Timeframe, EMA_Slow_Period, 0, MODE_EMA, PRICE_CLOSE);
+
+if(handleFastEMA == INVALID_HANDLE || handleSlowEMA == INVALID_HANDLE)
+
+{
+
+Print("ERROR: Failed to create EMA handles!");
+
+return(INIT_FAILED);
+
+}
+
+ArraySetAsSeries(fastEMA, true);
+
+ArraySetAsSeries(slowEMA, true);
+
+//--- Determine initial trend direction
+
+if(CopyBuffer(handleFastEMA, 0, 0, 3, fastEMA) >= 3 &&
+
+CopyBuffer(handleSlowEMA, 0, 0, 3, slowEMA) >= 3)
+
+{
+
+if(fastEMA[1] > slowEMA[1]) lastTrendDirection = 1;
+
+else if(fastEMA[1] < slowEMA[1]) lastTrendDirection = -1;
+
+}
+
+Print("=== EMA 9/21 Crossover EA v3 ===");
+
+Print("Fast EMA: ", EMA_Fast_Period, " | Slow EMA: ", EMA_Slow_Period);
+
+Print("Lot: ", LotSize);
+
+Print("Take Profit: $", TakeProfit_Dollar, " (auto-exit)");
+
+Print("Min Profit to Close on Signal: $", MinProfitToClose);
+
+Print("Trend Filter: ", TrendFilter ? "ON" : "OFF");
+
+Print("Initial Trend: ", lastTrendDirection == 1 ? "BULLISH" :
+
+lastTrendDirection == -1 ? "BEARISH" : "NEUTRAL");
+
+return(INIT_SUCCEEDED);
+
+}
+
+//+------------------------------------------------------------------+
+
+//| Expert deinitialization function |
+
+//+------------------------------------------------------------------+
+
+void OnDeinit(const int reason)
+
+{
+
+if(handleFastEMA != INVALID_HANDLE) IndicatorRelease(handleFastEMA);
+
+if(handleSlowEMA != INVALID_HANDLE) IndicatorRelease(handleSlowEMA);
+
+Print("=== EA v3 Removed ===");
+
+}
+
+//+------------------------------------------------------------------+
+
+//| Expert tick function |
+
+//+------------------------------------------------------------------+
+
+void OnTick()
+
+{
+
+//=================================================================
+
+// PHASE 1: TAKE PROFIT CHECK — Every single tick
+
+// If any open position reaches the profit target, close immediately
+
+// Then open a new trade in the current trend direction
+
+//=================================================================
+
+CheckTakeProfitOnTick();
+
+//=================================================================
+
+// PHASE 2: PENDING PROFIT-CLOSE CHECK — Every tick
+
+// If waiting for an old position to turn profitable before switching
+
+//=================================================================
+
+if(waitingForProfitClose && pendingSignal != 0)
+
+{
+
+HandlePendingProfitClose();
+
+}
+
+//=================================================================
+
+// PHASE 3: CROSSOVER DETECTION — Only on new bar close
+
+//=================================================================
+
+datetime currentBarTime = iTime(_Symbol, Timeframe, 0);
+
+if(currentBarTime == lastBarTime) return;
+
+lastBarTime = currentBarTime;
+
+if(CopyBuffer(handleFastEMA, 0, 0, 3, fastEMA) < 3) return;
+
+if(CopyBuffer(handleSlowEMA, 0, 0, 3, slowEMA) < 3) return;
+
+double fastCurr = fastEMA[1];
+
+double fastPrev = fastEMA[2];
+
+double slowCurr = slowEMA[1];
+
+double slowPrev = slowEMA[2];
+
+double closePrice = iClose(_Symbol, Timeframe, 1);
+
+//--- Detect crossovers
+
+bool bullishCross = (fastPrev <= slowPrev) && (fastCurr > slowCurr);
+
+bool bearishCross = (fastPrev >= slowPrev) && (fastCurr < slowCurr);
+
+//--- Update trend direction (always track, even if filtered)
+
+if(fastCurr > slowCurr) lastTrendDirection = 1;
+
+else if(fastCurr < slowCurr) lastTrendDirection = -1;
+
+//--- Apply trend filter
+
+if(TrendFilter)
+
+{
+
+if(bullishCross && closePrice < MathMin(fastCurr, slowCurr))
+
+{
+
+Print("FILTERED: Bullish crossover - Price below EMAs");
+
+bullishCross = false;
+
+}
+
+if(bearishCross && closePrice > MathMax(fastCurr, slowCurr))
+
+{
+
+Print("FILTERED: Bearish crossover - Price above EMAs");
+
+bearishCross = false;
+
+}
+
+}
+
+//--- Anti-whipsaw filter
+
+if((bullishCross || bearishCross) && lastTradeBarTime != 0)
+
+{
+
+int barsSince = Bars(_Symbol, Timeframe, lastTradeBarTime, currentBarTime) - 1;
+
+if(barsSince < MinBarsBetweenTrades)
+
+{
+
+Print("FILTERED: ", barsSince, " bars since last trade (need ", MinBarsBetweenTrades, ")");
+
+return;
+
+}
+
+}
+
+//=================================================================
+
+// PHASE 4: TRADE EXECUTION
+
+//=================================================================
+
+if(bullishCross)
+
+{
+
+Print("=== BULLISH CROSSOVER ===");
+
+Print(" 9 EMA: ", fastPrev, " -> ", fastCurr);
+
+Print(" 21 EMA: ", slowPrev, " -> ", slowCurr);
+
+HandleCrossoverSignal(1, currentBarTime);
+
+}
+
+if(bearishCross)
+
+{
+
+Print("=== BEARISH CROSSOVER ===");
+
+Print(" 9 EMA: ", fastPrev, " -> ", fastCurr);
+
+Print(" 21 EMA: ", slowPrev, " -> ", slowCurr);
+
+HandleCrossoverSignal(-1, currentBarTime);
+
+}
+
+}
+
+//+------------------------------------------------------------------+
+
+//| CHECK TAKE PROFIT ON EVERY TICK |
+
+//| Closes position if profit >= TakeProfit_Dollar |
+
+//| Then immediately opens a new trade in current trend direction |
+
+//+------------------------------------------------------------------+
+
+void CheckTakeProfitOnTick()
+
+{
+
+for(int i = PositionsTotal() - 1; i >= 0; i--)
+
+{
+
+ulong ticket = PositionGetTicket(i);
+
+if(ticket == 0) continue;
+
+if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+
+if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+
+double profit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+
+ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+//--- TAKE PROFIT HIT!
+
+if(profit >= TakeProfit_Dollar)
+
+{
+
+string dir = (posType == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+
+Print("$$$ TAKE PROFIT HIT! ", dir, " profit = $", profit,
+
+" >= target $", TakeProfit_Dollar);
+
+//--- Close the profitable position
+
+ClosePosition(ticket, posType);
+
+//--- Clear any pending signals since we just took profit
+
+pendingSignal = 0;
+
+waitingForProfitClose = false;
+
+//--- Immediately re-enter in the CURRENT trend direction
+
+//--- (based on latest EMA relationship)
+
+if(CopyBuffer(handleFastEMA, 0, 0, 2, fastEMA) >= 2 &&
+
+CopyBuffer(handleSlowEMA, 0, 0, 2, slowEMA) >= 2)
+
+{
+
+if(fastEMA[0] > slowEMA[0] && !HasOpenPosition(POSITION_TYPE_BUY))
+
+{
+
+Print(" >> Re-entering BUY (trend still bullish)");
+
+OpenTrade(ORDER_TYPE_BUY);
+
+lastTradeBarTime = iTime(_Symbol, Timeframe, 0);
+
+}
+
+else if(fastEMA[0] < slowEMA[0] && !HasOpenPosition(POSITION_TYPE_SELL))
+
+{
+
+Print(" >> Re-entering SELL (trend still bearish)");
+
+OpenTrade(ORDER_TYPE_SELL);
+
+lastTradeBarTime = iTime(_Symbol, Timeframe, 0);
+
+}
+
+else
+
+{
+
+Print(" >> No re-entry: EMAs flat or position already exists");
+
+}
+
+}
+
+return; // Process one TP at a time
+
+}
+
+}
+
+}
+
+//+------------------------------------------------------------------+
+
+//| Handle pending profit close (waiting for old pos to profit) |
+
+//+------------------------------------------------------------------+
+
+void HandlePendingProfitClose()
+
+{
+
+ENUM_POSITION_TYPE oldPosType = (pendingSignal == 1) ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
+
+if(HasOpenPosition(oldPosType))
+
+{
+
+double posProfit = GetPositionProfit(oldPosType);
+
+if(posProfit >= MinProfitToClose)
+
+{
+
+Print(">>> Pending close: Position now profitable ($", posProfit, ")");
+
+CloseAllPositions(oldPosType);
+
+//--- Open the queued trade
+
+if(pendingSignal == 1 && !HasOpenPosition(POSITION_TYPE_BUY))
+
+{
+
+OpenTrade(ORDER_TYPE_BUY);
+
+}
+
+else if(pendingSignal == -1 && !HasOpenPosition(POSITION_TYPE_SELL))
+
+{
+
+OpenTrade(ORDER_TYPE_SELL);
+
+}
+
+pendingSignal = 0;
+
+waitingForProfitClose = false;
+
+lastTradeBarTime = iTime(_Symbol, Timeframe, 0);
+
+}
+
+}
+
+else
+
+{
+
+//--- Position closed externally → open queued trade
+
+if(pendingSignal == 1 && !HasOpenPosition(POSITION_TYPE_BUY))
+
+OpenTrade(ORDER_TYPE_BUY);
+
+else if(pendingSignal == -1 && !HasOpenPosition(POSITION_TYPE_SELL))
+
+OpenTrade(ORDER_TYPE_SELL);
+
+pendingSignal = 0;
+
+waitingForProfitClose = false;
+
+lastTradeBarTime = iTime(_Symbol, Timeframe, 0);
+
+}
+
+}
+
+//+------------------------------------------------------------------+
+
+//| Handle crossover signal logic |
+
+//+------------------------------------------------------------------+
+
+void HandleCrossoverSignal(int direction, datetime barTime)
+
+{
+
+// direction: +1 = bullish (want BUY), -1 = bearish (want SELL)
+
+ENUM_POSITION_TYPE wantedPos = (direction == 1) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+
+ENUM_POSITION_TYPE oppositePos = (direction == 1) ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
+
+ENUM_ORDER_TYPE orderType = (direction == 1) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+
+string dirName = (direction == 1) ? "BUY" : "SELL";
+
+//--- Already in desired position
+
+if(HasOpenPosition(wantedPos))
+
+{
+
+Print(" Already in ", dirName, ". Skipping.");
+
+return;
+
+}
+
+//--- Opposite position exists
+
+if(HasOpenPosition(oppositePos))
+
+{
+
+double oppProfit = GetPositionProfit(oppositePos);
+
+if(oppProfit >= MinProfitToClose)
+
+{
+
+Print(" Opposite in profit ($", oppProfit, ") → Close & open ", dirName);
+
+CloseAllPositions(oppositePos);
+
+OpenTrade(orderType);
+
+lastTradeBarTime = barTime;
+
+}
+
+else
+
+{
+
+Print(" Opposite in LOSS ($", oppProfit, ") → Queuing ", dirName, ", waiting for profit");
+
+pendingSignal = direction;
+
+waitingForProfitClose = true;
+
+}
+
+}
+
+else
+
+{
+
+//--- No position → open directly
+
+OpenTrade(orderType);
+
+lastTradeBarTime = barTime;
+
+}
+
+}
+
+//+------------------------------------------------------------------+
+
+//| Open a trade |
+
+//+------------------------------------------------------------------+
+
+bool OpenTrade(ENUM_ORDER_TYPE orderType)
+
+{
+
+if(orderType == ORDER_TYPE_BUY && HasOpenPosition(POSITION_TYPE_BUY))
+
+{
+
+Print("BLOCKED: BUY already exists.");
+
+return false;
+
+}
+
+if(orderType == ORDER_TYPE_SELL && HasOpenPosition(POSITION_TYPE_SELL))
+
+{
+
+Print("BLOCKED: SELL already exists.");
+
+return false;
+
+}
+
+MqlTradeRequest request = {};
+
+MqlTradeResult result = {};
+
+request.action = TRADE_ACTION_DEAL;
+
+request.symbol = _Symbol;
+
+request.volume = LotSize;
+
+request.type = orderType;
+
+request.deviation = 10;
+
+request.magic = MagicNumber;
+
+request.sl = 0;
+
+request.tp = 0;
+
+string direction;
+
+if(orderType == ORDER_TYPE_BUY)
+
+{
+
+request.price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+direction = "BUY (LONG)";
+
+request.comment = "EMA_" + IntegerToString(EMA_Fast_Period) + "_" +
+
+IntegerToString(EMA_Slow_Period) + "_BUY";
+
+}
+
+else
+
+{
+
+request.price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+direction = "SELL (SHORT)";
+
+request.comment = "EMA_" + IntegerToString(EMA_Fast_Period) + "_" +
+
+IntegerToString(EMA_Slow_Period) + "_SELL";
+
+}
+
+request.type_filling = GetFillingMode();
+
+if(!OrderSend(request, result))
+
+{
+
+Print("ERROR: OrderSend failed! Code: ", GetLastError(),
+
+" | Retcode: ", result.retcode);
+
+return false;
+
+}
+
+if(result.retcode == TRADE_RETCODE_DONE || result.retcode == TRADE_RETCODE_PLACED)
+
+{
+
+Print("*** OPENED ", direction, " @ ", result.price,
+
+" | Lot: ", LotSize, " | #", result.order);
+
+return true;
+
+}
+
+Print("ERROR: Retcode ", result.retcode, " | ", result.comment);
+
+return false;
+
+}
+
+//+------------------------------------------------------------------+
+
+//| Close a single position by ticket |
+
+//+------------------------------------------------------------------+
+
+void ClosePosition(ulong ticket, ENUM_POSITION_TYPE posType)
+
+{
+
+MqlTradeRequest request = {};
+
+MqlTradeResult result = {};
+
+if(!PositionSelectByTicket(ticket)) return;
+
+request.action = TRADE_ACTION_DEAL;
+
+request.symbol = _Symbol;
+
+request.volume = PositionGetDouble(POSITION_VOLUME);
+
+request.deviation = 10;
+
+request.magic = MagicNumber;
+
+request.position = ticket;
+
+request.comment = "EMA_TP_Close";
+
+if(posType == POSITION_TYPE_BUY)
+
+{
+
+request.type = ORDER_TYPE_SELL;
+
+request.price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+}
+
+else
+
+{
+
+request.type = ORDER_TYPE_BUY;
+
+request.price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+}
+
+request.type_filling = GetFillingMode();
+
+if(!OrderSend(request, result))
+
+Print("ERROR: Close #", ticket, " failed | ", GetLastError());
+
+else
+
+Print("*** CLOSED #", ticket, " @ ", result.price);
+
+}
+
+//+------------------------------------------------------------------+
+
+//| Close all positions of a given type |
+
+//+------------------------------------------------------------------+
+
+void CloseAllPositions(ENUM_POSITION_TYPE posType)
+
+{
+
+for(int i = PositionsTotal() - 1; i >= 0; i--)
+
+{
+
+ulong ticket = PositionGetTicket(i);
+
+if(ticket == 0) continue;
+
+if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+
+if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+
+if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != posType) continue;
+
+ClosePosition(ticket, posType);
+
+}
+
+}
+
+//+------------------------------------------------------------------+
+
+//| Get total profit of a position type (including swap) |
+
+//+------------------------------------------------------------------+
+
+double GetPositionProfit(ENUM_POSITION_TYPE posType)
+
+{
+
+double total = 0;
+
+for(int i = PositionsTotal() - 1; i >= 0; i--)
+
+{
+
+ulong ticket = PositionGetTicket(i);
+
+if(ticket == 0) continue;
+
+if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+
+if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+
+if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == posType)
+
+{
+
+total += PositionGetDouble(POSITION_PROFIT);
+
+total += PositionGetDouble(POSITION_SWAP);
+
+}
+
+}
+
+return total;
+
+}
+
+//+------------------------------------------------------------------+
+
+//| Check if position of type exists |
+
+//+------------------------------------------------------------------+
+
+bool HasOpenPosition(ENUM_POSITION_TYPE posType)
+
+{
+
+for(int i = PositionsTotal() - 1; i >= 0; i--)
+
+{
+
+ulong ticket = PositionGetTicket(i);
+
+if(ticket == 0) continue;
+
+if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+
+if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+
+if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == posType)
+
+return true;
+
+}
+
+return false;
+
+}
+
+//+------------------------------------------------------------------+
+
+//| Get appropriate filling mode |
+
+//+------------------------------------------------------------------+
+
+ENUM_ORDER_TYPE_FILLING GetFillingMode()
+
+{
+
+long fm = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+
+if((fm & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK) return ORDER_FILLING_FOK;
+
+if((fm & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC) return ORDER_FILLING_IOC;
+
+return ORDER_FILLING_RETURN;
+
+}
+
+//+------------------------------------------------------------------+
